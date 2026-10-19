@@ -4,6 +4,8 @@ Rules
 - ONE "DOWN" alert when a site goes down, a reminder every 6 hours while it stays down.
 - ONE "RECOVERED" alert (with the downtime) when it comes back.
 - A "slow" warning when the response time passes the limit, at most once per hour.
+- Sites with "connection_refused_is_warning" get a WARNING (not DOWN) when the connection
+  is refused: once, then a reminder every 24 hours while it keeps happening.
 - If an alert could not be delivered by any channel, it is tried again on the next run.
 """
 
@@ -14,13 +16,27 @@ from .state import record_history
 from .timeutil import fmt_duration, fmt_time
 
 SLOW_WARNING_COOLDOWN_SECONDS = 3600
+REFUSED_REMINDER_SECONDS = 24 * 3600
 
 
 def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> list:
     """Update one site's state from a check result and return the alerts to send."""
     alerts = []
     response_ms = round(result.response_time * 1000) if result.response_time is not None else None
-    record_history(site_state, now, result.ok, response_ms)
+
+    # A site that is already DOWN stays in the normal DOWN flow. Timeouts, DNS errors,
+    # SSL errors and HTTP errors are never downgraded, only refused connections.
+    refused_as_warning = (
+        not result.ok
+        and result.error_kind == "connection"
+        and site.connection_refused_is_warning
+        and site_state["status"] != "down"
+    )
+    record_history(site_state, now, result.ok or refused_as_warning, response_ms)
+
+    if refused_as_warning:
+        return _refused_warning(site, site_state, result, now)
+    site_state["refused_active"] = False
 
     if not result.ok:
         if site_state["status"] != "down":
@@ -74,6 +90,34 @@ def _slow_alerts(site, site_state, result, now) -> list:
             details=[("Response time", f"{result.response_time:.2f}s"), ("HTTP status", str(result.status_code))],
             ts=now,
             tag="slow",
+            site_id=site.site_id,
+        )
+    ]
+
+
+def _refused_warning(site, site_state, result, now) -> list:
+    """Warning for a site whose refused connections are not treated as an outage."""
+    last = site_state["last_refused_alert"]
+    was_active = site_state["refused_active"]
+    site_state["refused_active"] = True
+    if last is not None:
+        # Same problem continuing gets a daily reminder. A new episode right after a
+        # recovery waits an hour, so a flapping site cannot flood the inbox.
+        wait = REFUSED_REMINDER_SECONDS if was_active else SLOW_WARNING_COOLDOWN_SECONDS
+        if now - last < wait:
+            return []
+    return [
+        Alert(
+            kind=WARNING,
+            site_name=site.name,
+            url=site.url,
+            summary=f"{result.error}. Counted as a warning, not DOWN, because of this site's setting.",
+            details=[
+                ("Checks", f"All {result.attempts} attempts failed"),
+                ("Setting", "connection_refused_is_warning is on for this site"),
+            ],
+            ts=now,
+            tag="refused",
             site_id=site.site_id,
         )
     ]
@@ -149,3 +193,5 @@ def apply_delivery(state: dict, alert: Alert, now: float) -> None:
         site_state["pending_recovery"] = None
     elif alert.tag == "slow":
         site_state["last_slow_alert"] = now
+    elif alert.tag == "refused":
+        site_state["last_refused_alert"] = now
