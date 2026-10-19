@@ -184,7 +184,10 @@ def run_checks(settings, sites, dry_run: bool) -> int:
 def _log_site_result(settings, site, result, site_state) -> None:
     name = settings.log_name(site)
     if result.ok:
-        log.info("%-9s UP    HTTP %s  %.2fs", name, result.status_code, result.response_time or 0)
+        extra = f" ({result.note})" if result.note else ""
+        log.info("%-9s UP    HTTP %s  %.2fs%s", name, result.status_code, result.response_time or 0, extra)
+    elif site_state.get("refused_active"):
+        log.warning("%-9s WARN  %s (warning only, not DOWN, by this site's setting)", name, result.error)
     else:
         since = fmt_time(site_state["down_since"]) if site_state.get("down_since") else "now"
         log.warning("%-9s DOWN  %s (down since %s)", name, result.error, since)

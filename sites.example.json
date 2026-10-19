@@ -6,9 +6,9 @@
     "slow_threshold_seconds": 6
   },
   {
-    "name": "Example Client Two (login protected)",
+    "name": "Example Client Two",
     "url": "https://client-two.example.org/",
-    "allow_auth": true,
+    "connection_refused_is_warning": false,
     "keywords_to_watch": ["hacked by", "casino"]
   },
   {

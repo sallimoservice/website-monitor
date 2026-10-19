@@ -27,6 +27,8 @@ DEFAULT_SITE_STATE = {
     "pending_recovery": None,   # a RECOVERED alert that has not been delivered yet
     "slow_active": False,       # True while the site is slower than its limit
     "last_slow_alert": None,    # when we last delivered a slow warning
+    "refused_active": False,    # True while a "connection refused" warning is in effect
+    "last_refused_alert": None, # when we last delivered a connection-refused warning
     "history": [],              # [[timestamp, 1 or 0 (up), response ms], ...]
 }
 

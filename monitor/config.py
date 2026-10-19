@@ -78,6 +78,7 @@ class Settings:
     request_timeout: float
     retry_attempts: int
     retry_gap_seconds: float
+    cloudflare_retry_gap_seconds: float
     default_slow_seconds: float
     down_reminder_hours: float
     max_workers: int
@@ -105,9 +106,10 @@ class Site:
     url: str
     site_id: str
     expected_domain: str
-    allow_auth: bool = False
     keywords_to_watch: tuple = ()
     slow_threshold_seconds: float = 8.0
+    # Off by default. When true, "connection refused" on this site is a warning, not DOWN.
+    connection_refused_is_warning: bool = False
 
     @property
     def label(self) -> str:
@@ -133,9 +135,10 @@ def load_settings() -> Settings:
         state_salt=_env("STATE_SALT"),
         state_path=_env("STATE_PATH", "state.json"),
         healthcheck_url=_env("HEALTHCHECK_URL"),
-        request_timeout=_env_number("REQUEST_TIMEOUT_SECONDS", 15.0, float),
-        retry_attempts=3,
-        retry_gap_seconds=_env_number("RETRY_GAP_SECONDS", 10.0, float),
+        request_timeout=_env_number("REQUEST_TIMEOUT_SECONDS", 30.0, float),
+        retry_attempts=4,
+        retry_gap_seconds=_env_number("RETRY_GAP_SECONDS", 15.0, float),
+        cloudflare_retry_gap_seconds=_env_number("CLOUDFLARE_RETRY_GAP_SECONDS", 30.0, float),
         default_slow_seconds=_env_number("DEFAULT_SLOW_SECONDS", 8.0, float),
         down_reminder_hours=6.0,
         max_workers=20,
@@ -213,6 +216,10 @@ def load_sites(settings: Settings) -> list:
             raise ConfigError(f"{where}: \"slow_threshold_seconds\" must be a number.") from None
         if slow <= 0:
             raise ConfigError(f"{where}: \"slow_threshold_seconds\" must be above 0.")
+        refused_is_warning = entry.get("connection_refused_is_warning", False)
+        if not isinstance(refused_is_warning, bool):
+            # A quoted "false" would count as true, so only real true/false is accepted.
+            raise ConfigError(f"{where}: \"connection_refused_is_warning\" must be true or false (no quotes).")
 
         sites.append(
             Site(
@@ -221,9 +228,9 @@ def load_sites(settings: Settings) -> list:
                 url=url,
                 site_id=site_id,
                 expected_domain=_normalize_domain(str(entry.get("expected_domain") or parsed.hostname)),
-                allow_auth=bool(entry.get("allow_auth", False)),
                 keywords_to_watch=tuple(str(k).strip() for k in keywords if str(k).strip()),
                 slow_threshold_seconds=slow,
+                connection_refused_is_warning=refused_is_warning,
             )
         )
     return sites
