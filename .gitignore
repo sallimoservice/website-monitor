@@ -1,0 +1,21 @@
+# Secrets and real client data. NEVER commit these.
+.env
+.env.*
+!.env.example
+sites.json
+state.json
+.state-*.tmp
+*.local.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+*.log
