@@ -1,0 +1,18 @@
+[
+  {
+    "name": "Example Client One",
+    "url": "https://client-one.example.com",
+    "expected_domain": "client-one.example.com",
+    "slow_threshold_seconds": 6
+  },
+  {
+    "name": "Example Client Two (login protected)",
+    "url": "https://client-two.example.org/",
+    "allow_auth": true,
+    "keywords_to_watch": ["hacked by", "casino"]
+  },
+  {
+    "name": "Example Client Three",
+    "url": "https://www.client-three.example.net"
+  }
+]

@@ -1,0 +1,109 @@
+name: Website Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"        # every 5 minutes (GitHub may start it a few minutes late)
+  workflow_dispatch:             # the "Run workflow" button
+    inputs:
+      dry_run:
+        description: "Dry run (run checks, send nothing, save nothing)"
+        type: boolean
+        default: false
+      test_alert:
+        description: "Send a test message to every configured channel"
+        type: boolean
+        default: false
+
+# Only one run at a time, so two runs can never corrupt the saved state.
+concurrency:
+  group: website-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write                 # needed only to delete old state caches
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # state.json lives in the Actions cache (private to this repo, never in the code).
+      # We always restore the newest saved copy and save a new one after every run.
+      - name: Restore saved state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: monitor-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            monitor-state-
+
+      - name: Run monitor
+        id: monitor
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONIOENCODING: "utf-8"
+          SITES_JSON: ${{ secrets.SITES_JSON }}
+          STATE_SALT: ${{ secrets.STATE_SALT }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          TEST_ALERT: ${{ inputs.test_alert }}
+        run: |
+          if [ "$TEST_ALERT" = "true" ]; then
+            python -m monitor.main --test-alert
+          elif [ "$DRY_RUN" = "true" ]; then
+            python -m monitor.main --dry-run
+          else
+            python -m monitor.main
+          fi
+
+      # If anything above crashed (even installing packages), tell the owner by email.
+      - name: Alert that the monitor is broken
+        if: failure() && inputs.test_alert != true && inputs.dry_run != true
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONIOENCODING: "utf-8"
+          STATE_SALT: ${{ secrets.STATE_SALT }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python -m monitor.main --notify-crash
+
+      - name: Save state
+        if: always() && inputs.dry_run != true && inputs.test_alert != true && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: monitor-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Cache entries cannot be overwritten, so each run adds one. Keep only the newest 3.
+      - name: Delete old state caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh cache list --key monitor-state- --sort created_at --order desc --limit 100 --json id --jq '.[3:][].id' \
+            | xargs -r -n1 gh cache delete
