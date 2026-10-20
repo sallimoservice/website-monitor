@@ -168,7 +168,8 @@ def classify_response(status: int, headers: dict, body: str) -> Classification:
 def classify_failure(kind: str, probes) -> str:
     """Label an attempt that got no HTTP answer.
 
-    `kind` is what went wrong: "ssl", "timeout", "redirects", "connection" or "other".
+    `kind` is what went wrong: "ssl_cert" (certificate rejected), "ssl" (other handshake
+    problem), "timeout", "redirects", "connection" or "other".
     `probes` is the DNS/TCP/TLS evidence collected right after the failure.
     """
     if probes is not None:
@@ -176,6 +177,8 @@ def classify_failure(kind: str, probes) -> str:
             return DNS_FAIL
         if probes.tcp == "fail":
             return CONN_FAIL
+    if kind == "ssl_cert":
+        return TLS_WARN   # requests itself rejected the certificate, no second opinion needed
     if kind == "ssl":
         if probes is not None and probes.tls == "cert_invalid":
             return TLS_WARN

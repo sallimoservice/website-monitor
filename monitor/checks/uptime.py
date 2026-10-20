@@ -105,8 +105,11 @@ def check_once(site, settings) -> UptimeResult:
                 _decode(bytes(body), reply.encoding),
                 reply.url,
             )
-    except requests.exceptions.SSLError:
-        failure_kind = "ssl"
+    except requests.exceptions.SSLError as exc:
+        # The certificate itself was rejected (expired, wrong name, untrusted) versus a
+        # handshake that broke for another reason. Only the first is a certificate warning.
+        text = str(exc).lower()
+        failure_kind = "ssl_cert" if ("certificate verify failed" in text or "certificate_verify_failed" in text) else "ssl"
     except requests.exceptions.Timeout:
         failure_kind = "timeout"
     except requests.exceptions.TooManyRedirects:

@@ -103,10 +103,20 @@ def probe_tcp(host: str, port: int, timeout: float) -> str:
         return "fail"
 
 
+def _tls_context() -> ssl.SSLContext:
+    """Trust the same certificate authorities as `requests` (certifi), so both agree."""
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def probe_tls(host: str, port: int, timeout: float) -> str:
     """Handshake with full certificate checking. cert_invalid = expired, wrong name, untrusted."""
     try:
-        context = ssl.create_default_context()
+        context = _tls_context()
         with socket.create_connection((host, port), timeout=timeout) as raw:
             with context.wrap_socket(raw, server_hostname=host):
                 return "ok"
