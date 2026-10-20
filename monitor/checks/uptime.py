@@ -11,6 +11,7 @@ A website is only DOWN when all three visits agree (see classify.compute_verdict
 from __future__ import annotations
 
 import logging
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -33,6 +34,10 @@ BASE_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 MAX_BODY_BYTES = 2_000_000
+# After a visit ends, wait at least this long (or the retry gap if that is shorter) before the
+# next visit to the same site. A site that just timed out is never hit again straight away.
+MIN_REST_SECONDS = 15.0
+_rng = random.Random()
 
 
 @dataclass
@@ -44,6 +49,7 @@ class UptimeResult:
     response_time: Optional[float] = None   # seconds
     error: Optional[str] = None             # plain-English reason when something failed
     started_at: float = 0.0                 # Unix time this visit began
+    finished_at: float = 0.0                # Unix time this visit ended (evidence collected)
     final_url: Optional[str] = None         # where we ended up after redirects
     # Page HTML for the content checks. ONLY kept for a clean normal page. A challenge,
     # block or error page is dropped inside check_once and never stored anywhere.
@@ -129,6 +135,7 @@ def check_once(site, settings) -> UptimeResult:
     if response is None:
         result.signal = classify.classify_failure(failure_kind, probes)
         result.error = _failure_text(result.signal, failure_kind, read_timeout)
+        result.finished_at = time.time()
         return result
 
     status, reason, reply_headers, text, final_url = response
@@ -148,6 +155,7 @@ def check_once(site, settings) -> UptimeResult:
         result.error = f"Cloudflare error {status} (Cloudflare cannot get a good answer from the server)"
     elif result.signal == classify.HTTP_ERROR:
         result.error = f"Website returned HTTP {status} {reason}".strip()
+    result.finished_at = time.time()
     return result
 
 
@@ -165,13 +173,22 @@ def _failure_text(signal: str, kind: Optional[str], read_timeout: float) -> str:
     return "Request failed (connection problem)"
 
 
-def _attempt(site, settings, previous_start: Optional[float], sleep, clock):
-    """One attempt, waiting first if needed. Returns None if our own code failed."""
+def _attempt(site, settings, previous, sleep, clock):
+    """One attempt, waiting first if needed. Returns None if our own code failed.
+
+    First visit  a random pause (0 to stagger_seconds) so sites do not all start together.
+    Later visits at least `retry_gap_seconds` after the previous visit STARTED, and at least a
+    short rest after it ENDED. A site is only ever visited by one attempt at a time.
+    """
     try:
-        if previous_start is not None:
-            wait = previous_start + settings.retry_gap_seconds - clock()
-            if wait > 0:
-                sleep(wait)
+        if previous is None:
+            wait = _rng.uniform(0, settings.stagger_seconds) if settings.stagger_seconds > 0 else 0
+        else:
+            rest = min(MIN_REST_SECONDS, settings.retry_gap_seconds)
+            earliest = max(previous.started_at + settings.retry_gap_seconds, previous.finished_at + rest)
+            wait = earliest - clock()
+        if wait > 0:
+            sleep(wait)
         return check_once(site, settings)
     except Exception:
         log.exception("%s internal check error", settings.log_name(site))
@@ -187,7 +204,7 @@ def _run_round(sites, attempts, settings, sleep, clock) -> dict:
                 _attempt,
                 site,
                 settings,
-                attempts[site.site_id][-1].started_at if attempts[site.site_id] else None,
+                attempts[site.site_id][-1] if attempts[site.site_id] else None,
                 sleep,
                 clock,
             )

@@ -111,6 +111,7 @@ class Settings:
     retry_attempts: int
     retry_gap_seconds: float
     text_recheck_gap_seconds: float
+    stagger_seconds: float
     default_slow_seconds: float
     check_every_hours: float
     user_agent: str
@@ -181,6 +182,9 @@ def load_settings() -> Settings:
         # Minimum time between the START of one attempt and the start of the next.
         retry_gap_seconds=_env_number("RETRY_GAP_SECONDS", 60.0, float),
         text_recheck_gap_seconds=_env_number("TEXT_RECHECK_GAP_SECONDS", 30.0, float),
+        # First visits start at random moments within this many seconds, so 17 requests never
+        # hit shared hosting in the same second. 0 switches it off.
+        stagger_seconds=_env_number("STAGGER_SECONDS", 20.0, float),
         default_slow_seconds=_env_number("DEFAULT_SLOW_SECONDS", 8.0, float),
         check_every_hours=_env_number("CHECK_EVERY_HOURS", 8.0, float),
         user_agent=_env("USER_AGENT", DEFAULT_USER_AGENT),
