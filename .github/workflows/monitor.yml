@@ -28,8 +28,8 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    # A run takes about 3 minutes when sites are failing (3 visits, 60 seconds apart), less
-    # when all is well. 10 minutes is a safety limit so a stuck run can never burn Actions minutes.
+    # A run takes up to about 4 minutes when sites are failing (3 visits, 60 seconds apart),
+    # and well under a minute when all is well. 10 minutes is a safety limit so a stuck run can never burn Actions minutes.
     timeout-minutes: 10
     steps:
       - name: Check out code
@@ -45,7 +45,8 @@ jobs:
         run: pip install -r requirements.txt
 
       # state.json lives in the Actions cache (private to this repo, never in the code).
-      # We always restore the newest saved copy and save a new one after every run.
+      # Every run restores the newest saved copy (reading is always safe). Only a real run
+      # saves a new one. Dry runs and test alerts never write to the cache.
       - name: Restore saved state
         uses: actions/cache/restore@v4
         with:
@@ -110,8 +111,9 @@ jobs:
           key: monitor-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Cache entries cannot be overwritten, so each run adds one. Keep only the newest 3.
+      # Dry runs and test alerts only READ the saved state. They never save and never delete.
       - name: Delete old state caches
-        if: always()
+        if: always() && inputs.dry_run != true && inputs.test_alert != true
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
