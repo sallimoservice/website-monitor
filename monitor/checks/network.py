@@ -16,6 +16,20 @@ from urllib.parse import urlparse
 
 import requests
 
+# Cloudflare's published address ranges (https://www.cloudflare.com/ips). Only a FALLBACK for
+# deciding that a site sits behind Cloudflare when it never answered. A response with Cloudflare
+# headers is the real proof. The list can change, so re-check that page now and then.
+_CLOUDFLARE_RANGES = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+        "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+        "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+        "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+        "2a06:98c0::/29", "2c0f:f248::/32",
+    )
+)
+
 RESOLVERS = (
     ("1.1.1.1", "https://cloudflare-dns.com/dns-query"),
     ("8.8.8.8", "https://dns.google/resolve"),
@@ -31,6 +45,7 @@ class Probes:
     tcp: str = "n/a"                          # ok / fail / dns_error (our own lookup failed)
     tls: str = "n/a"                          # ok / cert_invalid / fail / skipped / n/a (plain http)
     port: int = 443
+    addresses: list = field(default_factory=list)   # the IP addresses this machine resolves the site to
 
     @property
     def dns_failed(self) -> bool:
@@ -104,6 +119,22 @@ def probe_dns(host: str) -> dict:
         }
 
 
+def is_cloudflare_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(ip in network for network in _CLOUDFLARE_RANGES)
+
+
+def resolve_addresses(host: str, port: int) -> list:
+    """The addresses the site resolves to from here (used to spot sites sharing one server)."""
+    try:
+        return sorted({info[4][0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+    except (socket.gaierror, OSError):
+        return []
+
+
 def probe_tcp(host: str, port: int, timeout: float) -> str:
     try:
         socket.create_connection((host, port), timeout=timeout).close()
@@ -143,6 +174,7 @@ def run_probes(url: str, timeout: float) -> Probes:
     https = parsed.scheme == "https"
     port = parsed.port or (443 if https else 80)
     probes = Probes(port=port, dns=probe_dns(host))
+    probes.addresses = resolve_addresses(host, port)
     probes.tcp = probe_tcp(host, port, timeout)
     if not https:
         probes.tls = "n/a"

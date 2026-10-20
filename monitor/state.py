@@ -36,6 +36,8 @@ DEFAULT_SITE_STATE = {
     "text_missing_active": False,     # expected_text is confirmed missing
     "config_error_active": False,     # a site-side Cloudflare error (1016 ...) is confirmed
     "last_config_alert": None,
+    "origin_trouble_active": False,   # errors or timeouts from the server behind Cloudflare, confirmed
+    "last_origin_alert": None,
     "last_text_alert": None,
     "baseline_hash": None,      # content fingerprint of a CLEAN page (see store_baseline)
     "baseline_learned_at": None,

@@ -12,7 +12,13 @@ carries a cf-ray header, so origin errors are checked before challenges).
                          limit). Never DOWN, never an alert.
        CF_CONFIG_ERROR   a Cloudflare 1xxx page about the SITE (broken DNS or origin setup).
                          Never DOWN, but a WARNING once 3 visits in a row confirm it.
-    5. CHALLENGE         Cloudflare "checking your browser" style page (never DOWN)
+    5. CHALLENGE         Cloudflare "checking your browser" style page (never DOWN). Needs real
+                         proof: the cf-mitigated header or a challenge page marker. A cf-ray header
+                         plus a status code is NOT proof, Cloudflare adds cf-ray to answers it
+                         merely passes through from the server behind it.
+       ORIGIN_5XX        a 5xx answer passed through Cloudflare from the server behind it
+                         (502, 503, 504 ...) with no challenge marker. Never DOWN, but a WARNING
+                         when it is confirmed on 3 visits in a row.
     6. TIMEOUT           no answer within the time limit
        OTHER_FAIL        any other connection problem (redirect loop, reset ...)
     7. HTTP_ERROR        any other 4xx or 5xx answer
@@ -31,6 +37,7 @@ TLS_WARN = "TLS_WARN"
 CF_ORIGIN_ERROR = "CF_ORIGIN_ERROR"
 CF_VISITOR_BLOCK = "CF_VISITOR_BLOCK"
 CF_CONFIG_ERROR = "CF_CONFIG_ERROR"
+ORIGIN_5XX = "ORIGIN_5XX"
 CHALLENGE = "CHALLENGE"
 TIMEOUT = "TIMEOUT"
 OTHER_FAIL = "OTHER_FAIL"
@@ -42,6 +49,10 @@ STRICT_DOWN_SIGNALS = frozenset({DNS_FAIL, CONN_FAIL, CF_ORIGIN_ERROR})
 # Cloudflare answered, but with a page meant to stop visitors or bots. We cannot look
 # inside the real site, and we say nothing about it.
 INSPECTION_BLOCKED_SIGNALS = frozenset({CHALLENGE, CF_VISITOR_BLOCK})
+# Signals that all mean "the server behind Cloudflare is in trouble". On a Cloudflare site that is
+# not covered by an external monitor, three visits in a row from this family give a WARNING (all
+# CF_ORIGIN_ERROR is still a DOWN). A mix such as 522, then 504, then a timeout is still trouble.
+ORIGIN_TROUBLE_SIGNALS = frozenset({CF_ORIGIN_ERROR, ORIGIN_5XX, TIMEOUT})
 # Only a clean normal page may be used for content checks or saved as a baseline.
 SCANNABLE_SIGNALS = frozenset({OK})
 
@@ -88,13 +99,17 @@ CF_CONFIG_ERRORS = {
 # summary can mention it (see is_recognised_cf_code).
 CF_VISITOR_BLOCK_CODES = frozenset({1003, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1015, 1020, 1106})
 
+# Text that only a real challenge page contains.
 CHALLENGE_TEXT_MARKERS = (
     "just a moment",
     "attention required",
     "cf-chl",
-    "challenge-platform",
     "checking your browser",
 )
+# Cloudflare also puts a harmless script under /cdn-cgi/challenge-platform/ into ORDINARY pages,
+# including errors passed through from the server. So that word alone proves nothing. Only a
+# real challenge page also loads its "orchestrate" / "chl_page" scripts.
+_CHALLENGE_PLATFORM_PROOF = ("orchestrate", "chl_page")
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _CF_ERROR_PATTERNS = (
     re.compile(r"cf-error-code[^>]*>\s*(1\d{3})\s*<", re.IGNORECASE),
@@ -137,19 +152,20 @@ def find_cf_error_code(status: int, headers: dict, body: str) -> Optional[int]:
 def find_challenge(status: int, headers: dict, body: str) -> Optional[str]:
     """Detect a Cloudflare challenge. Returns the name of the marker that matched.
 
-    Words like "challenge-platform" sit inside the ordinary 200 pages of many protected
-    sites, so text markers only count on error answers. On a 200 only the exact
-    "Just a moment..." page title counts.
+    Proof is one of: the cf-mitigated header, a challenge marker in the page of an error
+    answer, or on a 200 the exact "Just a moment..." title. A cf-ray header with a status code
+    is deliberately NOT proof (see the module notes), or an overloaded server's 503 would be
+    mistaken for a challenge and go unreported.
     """
     if "cf-mitigated" in headers:
         return "header cf-mitigated"
-    if "cf-ray" in headers and status in (403, 429, 503):
-        return f"cf-ray with HTTP {status}"
     if status != 200:
         lowered = (body or "")[:_SCAN_LIMIT].lower()
         for marker in CHALLENGE_TEXT_MARKERS:
             if marker in lowered:
                 return f"text '{marker}'"
+        if "challenge-platform" in lowered and any(word in lowered for word in _CHALLENGE_PLATFORM_PROOF):
+            return "text 'challenge-platform' (challenge page)"
         return None
     title = _TITLE_RE.search((body or "")[:20_000])
     if title and title.group(1).strip().lower().startswith("just a moment"):
@@ -169,6 +185,8 @@ def classify_response(status: int, headers: dict, body: str) -> Classification:
     marker = find_challenge(status, headers, body)
     if marker:
         return Classification(CHALLENGE, marker)
+    if status >= 500 and is_cloudflare(headers):
+        return Classification(ORIGIN_5XX)   # Cloudflare passed on an error from the server behind it
     if status >= 400:
         return Classification(HTTP_ERROR)
     return Classification(OK)
@@ -224,9 +242,24 @@ def down_eligible(signal: str, status_code: Optional[int], strict: bool) -> bool
         return False
     if signal in (TIMEOUT, OTHER_FAIL):
         return True
-    if signal == HTTP_ERROR:
+    if signal in (HTTP_ERROR, ORIGIN_5XX):
         return status_code is not None and (status_code >= 500 or status_code in BROKEN_PAGE_CODES)
     return False
+
+
+def warns_on_origin_trouble(site, attempts, cloudflare_seen: bool) -> bool:
+    """Cloudflare sites that do not hand their uptime to an external monitor get the warning."""
+    return is_strict(site, attempts, cloudflare_seen) and site.uptime_source != "external"
+
+
+def origin_trouble_confirmed(site, attempts, cloudflare_seen: bool, needed: int) -> bool:
+    """3 visits in a row from ORIGIN_TROUBLE_SIGNALS, not all CF_ORIGIN_ERROR (that is a DOWN)."""
+    if len(attempts) < needed or not warns_on_origin_trouble(site, attempts, cloudflare_seen):
+        return False
+    signals = [a.signal for a in attempts]
+    if not all(s in ORIGIN_TROUBLE_SIGNALS for s in signals):
+        return False
+    return not all(s == CF_ORIGIN_ERROR for s in signals)
 
 
 def needs_another_attempt(site, attempts, cloudflare_seen: bool, needed: int) -> bool:
@@ -235,6 +268,8 @@ def needs_another_attempt(site, attempts, cloudflare_seen: bool, needed: int) ->
         return False
     if all(a.signal == CF_CONFIG_ERROR for a in attempts):
         return True   # a site-side Cloudflare error is confirmed by seeing it 3 times in a row
+    if warns_on_origin_trouble(site, attempts, cloudflare_seen) and all(a.signal in ORIGIN_TROUBLE_SIGNALS for a in attempts):
+        return True   # trouble behind Cloudflare is confirmed the same way
     strict = is_strict(site, attempts, cloudflare_seen)
     if not all(down_eligible(a.signal, a.status_code, strict) for a in attempts):
         return False

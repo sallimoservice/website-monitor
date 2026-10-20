@@ -22,7 +22,7 @@ from . import heartbeat
 from . import state as state_store
 from .alerts import CRASH, TEST, WARNING, Alert
 from .checks import classify
-from .checks.network import dns_words
+from .checks.network import dns_words, is_cloudflare_address
 from .config import (
     ConfigError,
     load_dotenv,
@@ -157,7 +157,7 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
     log.info("Checking %d website(s)%s ...", len(sites), " (dry run, nothing will be sent)" if dry_run else "")
     results = run_uptime_checks(sites, settings, cloudflare_seen)
 
-    alerts, rows, advice, internal_errors = [], [], [], 0
+    alerts, rows, advice, hosting, internal_errors = [], [], [], [], 0
     counts = Counter()
     paused, resumed, auto_detected = [], [], []
     dns_lookup_failures = 0
@@ -187,6 +187,7 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
             unrecognised_codes[str(result.cf_code)] += 1
         rows.append(_table_row(settings, site, result, site_state))
         advice.append(_advice_row(settings, site, result))
+        hosting.append(_hosting_entry(settings, site, result, site_state))
         if settings.real_names_in_logs:   # per-site lines only on your own PC, never in public logs
             log.info("%-24s %-18s %s", settings.log_name(site), site_state["last_state"], _short_result(result))
 
@@ -212,7 +213,7 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
     _log_aggregate(stats)
 
     if dry_run:
-        _print_dry_run(settings, rows, advice, alerts, auto_detected, stats)
+        _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats)
         return 1 if internal_errors else 0
 
     if alerts:
@@ -339,15 +340,23 @@ def _advice_row(settings, site, result) -> list:
     todo = []
     if result.verdict == classify.VERDICT_DOWN:
         todo.append(f"failing now ({result.signal}), check this site first")
+    if result.origin_trouble_confirmed:
+        todo.append("the server behind Cloudflare is in trouble (warning email sent), check this site first")
     if result.cloudflare and not site.behind_cloudflare:
-        todo.append('"behind_cloudflare": true')
+        todo.append(
+            'Cloudflare detected: set "behind_cloudflare" only after an external monitor covers this site '
+            "(Cloudflare rules already apply to it, because its headers were seen)"
+        )
     if site.behind_cloudflare and got_response and not result.cloudflare:
         todo.append("behind_cloudflare is set but no Cloudflare headers were seen")
     cannot_judge = result.signal in classify.INSPECTION_BLOCKED_SIGNALS or (
         result.signal == classify.HTTP_ERROR and result.verdict != classify.VERDICT_DOWN
     )
     if cannot_judge and site.uptime_source != "external":
-        todo.append('"uptime_source": "external" if an external monitor covers it (GitHub cannot judge this site)')
+        todo.append(
+            '"uptime_source": "external" only once your external monitor has been green on this site for a day '
+            "(GitHub cannot judge it)"
+        )
     if result.signal == classify.TLS_WARN and not (site.behind_cloudflare or result.cloudflare):
         todo.append("certificate problem: fix the certificate, or set behind_cloudflare if Cloudflare issues it")
     if not todo:
@@ -369,12 +378,87 @@ def _print_table(headers, rows) -> None:
         print(line(row))
 
 
-def _print_dry_run(settings, rows, advice, alerts, auto_detected, stats) -> None:
+def _hosting_entry(settings, site, result, site_state) -> dict:
+    """What we know about where a site lives, for the 'who shares a server' report."""
+    attempts = result.attempt_log or [result]
+    probes = next((a.probes for a in reversed(attempts) if a.probes), None)
+    addresses = list(probes.addresses) if probes else []
+    # Evidence only, never the config flag: Cloudflare headers on a real answer, a sighting on an
+    # earlier run, or addresses that all belong to Cloudflare.
+    on_cloudflare = bool(
+        result.cloudflare
+        or site_state.get("cloudflare_seen")
+        or (addresses and all(is_cloudflare_address(a) for a in addresses))
+    )
+    return {"label": settings.log_name(site), "addresses": addresses, "cloudflare": on_cloudflare, "server": result.server or ""}
+
+
+def group_by_address(entries):
+    """Sites that resolve to a shared address, Cloudflare sites kept apart.
+
+    Returns (groups, cloudflare_labels, no_address_labels). A group is a dict with the member
+    labels, their addresses and any Server headers. Groups are formed from sites that have at
+    least one address in common.
+    """
+    no_address = [e["label"] for e in entries if not e["addresses"]]
+    with_address = [e for e in entries if e["addresses"]]
+    cloudflare = [e["label"] for e in with_address if e["cloudflare"]]
+    members = [e for e in with_address if not e["cloudflare"]]
+    parent = list(range(len(members)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    owner = {}
+    for i, entry in enumerate(members):
+        for address in entry["addresses"]:
+            if address in owner:
+                parent[find(i)] = find(owner[address])
+            else:
+                owner[address] = i
+    clusters = {}
+    for i, entry in enumerate(members):
+        clusters.setdefault(find(i), []).append(entry)
+    groups = []
+    for cluster in clusters.values():
+        if len(cluster) < 2:
+            continue
+        groups.append(
+            {
+                "labels": [e["label"] for e in cluster],
+                "addresses": sorted({a for e in cluster for a in e["addresses"]}),
+                "servers": sorted({e["server"] for e in cluster if e["server"]}),
+            }
+        )
+    return groups, cloudflare, no_address
+
+
+def _print_hosting(settings, entries) -> None:
+    groups, cloudflare, no_address = group_by_address(entries)
+    print("WHO SHARES A SERVER (sites grouped by the address they resolve to, Cloudflare sites listed apart)")
+    for group in groups:
+        servers = ", ".join(group["servers"]) or "no Server header seen"
+        where = f", address {' / '.join(group['addresses'])}" if settings.real_names_in_logs else ""
+        print(f"  {', '.join(group['labels'])} share one address (Server header: {servers}{where})")
+    if not groups:
+        print("  No two non-Cloudflare sites share an address.")
+    if cloudflare:
+        print(f"  Cloudflare, so their addresses are Cloudflare's and not grouped: {', '.join(cloudflare)}")
+    if no_address:
+        print(f"  No address found: {', '.join(no_address)}")
+
+
+def _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats) -> None:
     print()
     _print_table(TABLE_HEADERS, rows)
     print()
     print("SETTINGS HELP (suggestions only, nothing is changed for you)")
     _print_table(ADVICE_HEADERS, advice)
+    print()
+    _print_hosting(settings, hosting)
     print()
     if stats["dns_degraded"]:
         print(f"DNS checking is degraded: lookups failed for {stats['dns_lookup_failures']} site(s), "

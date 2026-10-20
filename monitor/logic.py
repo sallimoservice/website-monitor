@@ -15,6 +15,11 @@ Rules
   becomes a WARNING once 3 visits in a row show it. 1xxx pages about the VISITOR (1020, 1015 ...)
   stay silent.
 
+- Trouble behind Cloudflare (a mix of 5xx answers passed through from the server, Cloudflare 52x
+  errors and timeouts) is never DOWN unless all 3 visits are the same Cloudflare 52x error, but 3
+  visits in a row give a WARNING. It repeats every 8 hours while it lasts. Sites that hand their
+  uptime to an external monitor stay silent for it.
+
 Labels are separate from alerts. A site only gets the label UP when the monitor received a clean
 normal page. A 403 or 503 answer, a missing response or a challenge page never earns UP, even
 when (as always) no alert is sent for it.
@@ -50,6 +55,8 @@ def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> lis
         return []
     if not result.config_confirmed:
         site_state["config_error_active"] = False
+    if not result.origin_trouble_confirmed:
+        site_state["origin_trouble_active"] = False
 
     is_down = result.verdict == c.VERDICT_DOWN
     # A site that is already DOWN stays in the normal DOWN flow. Timeouts, DNS errors,
@@ -90,6 +97,7 @@ def _final_state(site_state: dict, result) -> str:
         or site_state["tls_warn_active"]
         or site_state["text_missing_active"]
         or site_state["config_error_active"]
+        or site_state["origin_trouble_active"]
     ):
         return "WARNING"
     if result.signal in c.INSPECTION_BLOCKED_SIGNALS:
@@ -107,7 +115,8 @@ def _final_state(site_state: dict, result) -> str:
 def _handle_down(site, site_state, result, now, settings) -> list:
     site_state["inspection_blocked"] = False
     site_state["down_inconclusive_since"] = None
-    site_state["down_signal"] = result.signal
+    if result.verdict == c.VERDICT_DOWN:
+        site_state["down_signal"] = result.signal
     if site_state["status"] != "down":
         site_state.update(
             status="down",
@@ -148,6 +157,10 @@ def _handle_not_down(site, site_state, result, now, settings) -> list:
     cloudflare_site = site.behind_cloudflare or site_state["cloudflare_seen"]
 
     if site_state["status"] == "down":
+        if result.origin_trouble_confirmed and site_state["down_signal"] == c.CF_ORIGIN_ERROR:
+            # The origin is still in trouble, only the kind of error changed (522, then 504 ...).
+            # That is the same outage, so the 8 hour reminders carry on.
+            return _handle_down(site, site_state, result, now, settings)
         if not _clears_outage(site_state, result):
             # Inconclusive answer. Keep the outage open, send nothing (not even a reminder).
             if site_state["down_inconclusive_since"] is None:
@@ -178,6 +191,8 @@ def _handle_not_down(site, site_state, result, now, settings) -> list:
         alerts.extend(_tls_warning(site, site_state, result, now, settings))
     elif signal == c.CF_CONFIG_ERROR and result.config_confirmed:
         alerts.extend(_config_warning(site, site_state, result, now, settings))
+    elif result.origin_trouble_confirmed:
+        alerts.extend(_origin_warning(site, site_state, result, now, settings))
     elif cloudflare_site:
         site_state["tls_warn_active"] = False   # the certificate we see is Cloudflare's, not the client's
     return alerts
@@ -279,6 +294,32 @@ def _config_warning(site, site_state, result, now, settings) -> list:
         )
 
     return _episode_warning(site_state, now, "config_error_active", "last_config_alert", WARNING_REMINDER_SECONDS, make)
+
+
+def _origin_warning(site, site_state, result, now, settings) -> list:
+    """The server behind Cloudflare is overloaded or broken. A warning to judge, never a DOWN."""
+    attempts = result.attempt_log or [result]
+    seen = ", ".join(f"HTTP {a.status_code}" if a.status_code else "no answer (timeout)" for a in attempts)
+
+    def make():
+        return Alert(
+            kind=WARNING,
+            site_name=site.name,
+            url=site.url,
+            summary=(
+                f"The server behind Cloudflare looks overloaded or broken. On {len(attempts)} visits in a row "
+                f"the result was {seen}."
+            ),
+            details=[("Checks", f"{len(attempts)} visits, at least {settings.retry_gap_seconds:g} seconds apart, all in trouble")]
+            + _evidence(result),
+            ts=now,
+            tag="origin",
+            site_id=site.site_id,
+        )
+
+    return _episode_warning(
+        site_state, now, "origin_trouble_active", "last_origin_alert", settings.down_reminder_hours * 3600, make
+    )
 
 
 def _text_alerts(site, site_state, result, now, settings) -> list:
@@ -400,3 +441,5 @@ def apply_delivery(state: dict, alert: Alert, now: float) -> None:
         site_state["last_text_alert"] = now
     elif alert.tag == "cfconfig":
         site_state["last_config_alert"] = now
+    elif alert.tag == "origin":
+        site_state["last_origin_alert"] = now
