@@ -25,6 +25,18 @@ DEFAULT_USER_AGENT = (
 UPTIME_SOURCES = ("self", "external")
 
 
+# Settings that no longer do anything. If one is still set, say so once instead of ignoring it silently.
+REMOVED_SETTINGS = {
+    "REQUEST_TIMEOUT_SECONDS": (
+        "is ignored. It is replaced by CONNECT_TIMEOUT_SECONDS (default 10) and READ_TIMEOUT_SECONDS (default 20)."
+    ),
+    "CLOUDFLARE_RETRY_GAP_SECONDS": (
+        "is ignored. Every failing site now gets 3 visits at least RETRY_GAP_SECONDS (default 60) apart."
+    ),
+}
+MIN_RECOMMENDED_RETRY_GAP = 60.0
+
+
 class ConfigError(Exception):
     """A problem the user can fix by editing their settings."""
 
@@ -178,6 +190,23 @@ def load_settings() -> Settings:
     )
 
 
+def warn_about_removed_settings() -> None:
+    """One masked line per removed setting that is still set (the value is never printed)."""
+    for name, hint in REMOVED_SETTINGS.items():
+        if _env(name):
+            log.warning("Setting %s is still set but %s", name, hint)
+    gap = _env("RETRY_GAP_SECONDS")
+    try:
+        if gap and float(gap) < MIN_RECOMMENDED_RETRY_GAP:
+            log.warning(
+                "RETRY_GAP_SECONDS is set below %g. The rules call for visits at least %g seconds apart.",
+                MIN_RECOMMENDED_RETRY_GAP,
+                MIN_RECOMMENDED_RETRY_GAP,
+            )
+    except ValueError:
+        pass  # a non-number is reported when the settings are loaded
+
+
 def make_site_id(salt: str, url: str) -> str:
     """Anonymous ID for a site. Only this hash is stored in state.json, never the URL."""
     key = (salt or "website-monitor").encode("utf-8")
@@ -287,6 +316,14 @@ def load_sites_report(settings: Settings) -> SiteLoad:
         raise ConfigError("SITES_JSON must be a JSON list with at least one website.")
 
     report, seen_ids = SiteLoad(), set()
+    legacy = sum(1 for entry in data if isinstance(entry, dict) and "allow_auth" in entry)
+    if legacy:
+        log.warning(
+            "\"allow_auth\" is ignored (found in %d website entr%s). 401, 403, 405 and 429 answers never "
+            "cause DOWN any more, so it is no longer needed.",
+            legacy,
+            "y" if legacy == 1 else "ies",
+        )
     for position, entry in enumerate(data, start=1):
         try:
             report.sites.append(_parse_entry(settings, position, entry, seen_ids))

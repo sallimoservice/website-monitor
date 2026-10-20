@@ -22,7 +22,14 @@ from . import heartbeat
 from . import state as state_store
 from .alerts import CRASH, TEST, WARNING, Alert
 from .checks import classify
-from .config import ConfigError, load_dotenv, load_settings, load_sites, load_sites_report
+from .config import (
+    ConfigError,
+    load_dotenv,
+    load_settings,
+    load_sites,
+    load_sites_report,
+    warn_about_removed_settings,
+)
 from .log import mask_in_actions, register_sensitive, setup_logging
 from .logic import apply_delivery, evaluate_uptime
 from .notifiers import build_notifiers, dispatch
@@ -59,6 +66,7 @@ def _protect_sites(settings, sites) -> None:
 
 
 def _warn_about_missing_basics(settings) -> None:
+    warn_about_removed_settings()
     if not settings.state_salt:
         log.warning("STATE_SALT is not set. Set it to any random text so stored IDs cannot be guessed.")
     if not settings.email_enabled:
@@ -182,6 +190,7 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
         "SLOW": counts["SLOW"],
         "DOWN": counts["DOWN"],
         "WARNING": counts["WARNING"],
+        "UNKNOWN": counts["UNKNOWN"],
         "INSPECTION_BLOCKED": counts["INSPECTION_BLOCKED"],
         "mixed": counts["mixed"],
         "skipped_config": skipped,
@@ -234,8 +243,8 @@ def _scan_change_alert(paused, resumed, now) -> Alert:
 def _log_aggregate(stats) -> None:
     """The only per-run summary that goes into public logs: counts, never names."""
     log.info(
-        "%d site(s) checked: %d UP, %d SLOW, %d DOWN, %d WARNING",
-        stats["sites"], stats["UP"], stats["SLOW"], stats["DOWN"], stats["WARNING"],
+        "%d site(s) checked: %d UP, %d SLOW, %d DOWN, %d WARNING, %d UNKNOWN (no clean page)",
+        stats["sites"], stats["UP"], stats["SLOW"], stats["DOWN"], stats["WARNING"], stats["UNKNOWN"],
     )
     if stats["INSPECTION_BLOCKED"]:
         log.info("%d sites inspection-blocked", stats["INSPECTION_BLOCKED"])

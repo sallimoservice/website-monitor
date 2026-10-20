@@ -11,6 +11,13 @@ Rules
   is refused: once, then a reminder every 24 hours while it keeps happening.
 - An invalid or expired certificate is a WARNING (never DOWN) on sites not behind Cloudflare.
 - A missing expected_text on a normal page is a WARNING.
+- A Cloudflare 1xxx page about the SITE (1016 origin DNS error and similar) is never DOWN, but
+  becomes a WARNING once 3 visits in a row show it. 1xxx pages about the VISITOR (1020, 1015 ...)
+  stay silent.
+
+Labels are separate from alerts. A site only gets the label UP when the monitor received a clean
+normal page. A 403 or 503 answer, a missing response or a challenge page never earns UP, even
+when (as always) no alert is sent for it.
 - If an alert could not be delivered by any channel, it is tried again on the next run.
 """
 
@@ -37,8 +44,11 @@ def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> lis
 
     if result.verdict == c.VERDICT_MIXED:
         # Three trustworthy failures of different kinds. Say nothing, look again next run.
-        record_history(site_state, now, True, response_ms)
+        record_history(site_state, now, None, response_ms)
+        site_state["last_state"] = "DOWN" if site_state["status"] == "down" else "UNKNOWN"
         return []
+    if not result.config_confirmed:
+        site_state["config_error_active"] = False
 
     is_down = result.verdict == c.VERDICT_DOWN
     # A site that is already DOWN stays in the normal DOWN flow. Timeouts, DNS errors,
@@ -49,7 +59,14 @@ def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> lis
         and site.connection_refused_is_warning
         and site_state["status"] != "down"
     )
-    record_history(site_state, now, (not is_down) or refused_as_warning, response_ms)
+    # History: 1 = clean page, 0 = confirmed down, None = unknown (no usable page either way).
+    if is_down and not refused_as_warning:
+        history_flag = False
+    elif result.signal == c.OK:
+        history_flag = True
+    else:
+        history_flag = None
+    record_history(site_state, now, history_flag, response_ms)
 
     if refused_as_warning:
         site_state["inspection_blocked"] = False
@@ -67,12 +84,20 @@ def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> lis
 def _final_state(site_state: dict, result) -> str:
     if site_state["status"] == "down":
         return "DOWN"
-    if site_state["refused_active"] or site_state["tls_warn_active"] or site_state["text_missing_active"]:
+    if (
+        site_state["refused_active"]
+        or site_state["tls_warn_active"]
+        or site_state["text_missing_active"]
+        or site_state["config_error_active"]
+    ):
         return "WARNING"
-    # Only Cloudflare challenge/block pages count as INSPECTION_BLOCKED. A plain 403 on a
-    # normal site is still UP (the server answered), exactly as before.
     if result.signal in c.INSPECTION_BLOCKED_SIGNALS:
         return "INSPECTION_BLOCKED"
+    # No clean page, no UP. This covers a 403 or 503 answer, a certificate problem, a timeout
+    # on a site where timeouts never alert, and so on. Whether an email is sent is decided
+    # elsewhere and has not changed.
+    if result.signal != c.OK or result.status_code is None:
+        return "UNKNOWN"
     if site_state["slow_active"]:
         return "SLOW"
     return "UP"
@@ -150,6 +175,8 @@ def _handle_not_down(site, site_state, result, now, settings) -> list:
         alerts.extend(_text_alerts(site, site_state, result, now, settings))
     elif signal == c.TLS_WARN and not cloudflare_site:
         alerts.extend(_tls_warning(site, site_state, result, now, settings))
+    elif signal == c.CF_CONFIG_ERROR and result.config_confirmed:
+        alerts.extend(_config_warning(site, site_state, result, now, settings))
     elif cloudflare_site:
         site_state["tls_warn_active"] = False   # the certificate we see is Cloudflare's, not the client's
     return alerts
@@ -232,6 +259,27 @@ def _tls_warning(site, site_state, result, now, settings) -> list:
     return _episode_warning(site_state, now, "tls_warn_active", "last_tls_alert", WARNING_REMINDER_SECONDS, make)
 
 
+def _config_warning(site, site_state, result, now, settings) -> list:
+    """Cloudflare says the SITE is misconfigured (for example 1016). Confirmed on 3 visits."""
+    code = result.cf_code
+    meaning = c.CF_CONFIG_ERRORS.get(code, "Cloudflare reports a configuration problem with this site.")
+
+    def make():
+        return Alert(
+            kind=WARNING,
+            site_name=site.name,
+            url=site.url,
+            summary=f"Cloudflare error {code}. {meaning}",
+            details=[("Checks", f"Seen on all {result.attempts} visits, at least {settings.retry_gap_seconds:g} seconds apart")]
+            + _evidence(result),
+            ts=now,
+            tag="cfconfig",
+            site_id=site.site_id,
+        )
+
+    return _episode_warning(site_state, now, "config_error_active", "last_config_alert", WARNING_REMINDER_SECONDS, make)
+
+
 def _text_alerts(site, site_state, result, now, settings) -> list:
     """expected_text is only judged on a clean normal page, never on a challenge or error page."""
     if not site.expected_text or result.status_code != 200:
@@ -262,6 +310,9 @@ def _evidence(result) -> list:
     rows.append(("HTTP status", ", ".join(str(a.status_code) if a.status_code else "no response" for a in attempts)))
     ray = next((a.cf_ray for a in attempts if a.cf_ray), None)
     mitigated = next((a.cf_mitigated for a in attempts if a.cf_mitigated), None)
+    codes = [str(a.cf_code) for a in attempts if a.cf_code]
+    if codes:
+        rows.append(("Cloudflare error code", ", ".join(codes)))
     if ray:
         rows.append(("Cloudflare cf-ray", ray))
     if mitigated:
@@ -346,3 +397,5 @@ def apply_delivery(state: dict, alert: Alert, now: float) -> None:
         site_state["last_tls_alert"] = now
     elif alert.tag == "text":
         site_state["last_text_alert"] = now
+    elif alert.tag == "cfconfig":
+        site_state["last_config_alert"] = now

@@ -25,7 +25,7 @@ HISTORY_SECONDS = 25 * 3600  # keep a little over 24h of check results for the d
 
 DEFAULT_SITE_STATE = {
     "status": "unknown",        # unknown / up / down (the outage tracker)
-    "last_state": "UP",         # UP / SLOW / DOWN / INSPECTION_BLOCKED / WARNING as of the last run
+    "last_state": "UNKNOWN",    # UP / SLOW / DOWN / WARNING / INSPECTION_BLOCKED / UNKNOWN as of the last run
     "last_up_at": None,         # last time the site gave a clean "up" answer
     "down_signal": None,        # what kind of failure started the outage (DNS_FAIL, CONN_FAIL ...)
     "down_inconclusive_since": None,  # outage still open, but only challenge/error pages seen since
@@ -34,6 +34,8 @@ DEFAULT_SITE_STATE = {
     "tls_warn_active": False,   # a certificate warning is in effect
     "last_tls_alert": None,
     "text_missing_active": False,     # expected_text is confirmed missing
+    "config_error_active": False,     # a site-side Cloudflare error (1016 ...) is confirmed
+    "last_config_alert": None,
     "last_text_alert": None,
     "baseline_hash": None,      # content fingerprint of a CLEAN page (see store_baseline)
     "baseline_learned_at": None,
@@ -44,7 +46,7 @@ DEFAULT_SITE_STATE = {
     "last_slow_alert": None,    # when we last delivered a slow warning
     "refused_active": False,    # True while a "connection refused" warning is in effect
     "last_refused_alert": None, # when we last delivered a connection-refused warning
-    "history": [],              # [[timestamp, 1 or 0 (up), response ms], ...]
+    "history": [],              # [[timestamp, 1 clean / 0 down / null unknown, response ms], ...]
 }
 
 
@@ -104,10 +106,14 @@ def prune_removed_sites(state: dict, active_ids) -> int:
     return len(stale)
 
 
-def record_history(site_state: dict, now: float, ok: bool, response_ms) -> None:
-    """Remember this check result and drop anything older than ~25 hours."""
+def record_history(site_state: dict, now: float, ok, response_ms) -> None:
+    """Remember this check result and drop anything older than ~25 hours.
+
+    `ok` is True (clean answer), False (confirmed down) or None (unknown: the monitor got
+    no usable page, so it can say nothing about the site).
+    """
     history = site_state["history"]
-    history.append([int(now), 1 if ok else 0, response_ms])
+    history.append([int(now), None if ok is None else (1 if ok else 0), response_ms])
     cutoff = now - HISTORY_SECONDS
     site_state["history"] = [row for row in history if row[0] >= cutoff]
 

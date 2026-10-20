@@ -52,6 +52,7 @@ class UptimeResult:
     cf_ray: Optional[str] = None
     cf_mitigated: Optional[str] = None
     marker: Optional[str] = None            # name of the challenge marker that matched
+    cf_code: Optional[int] = None           # Cloudflare 1xxx code, when the page showed one
     cloudflare: bool = False                # the answer came through Cloudflare
     probes: Optional[Probes] = None
     # Filled in on the final result of a site:
@@ -60,6 +61,7 @@ class UptimeResult:
     verdict: str = classify.VERDICT_NOT_DOWN
     strict: bool = False
     text_missing: bool = False              # expected_text confirmed missing on a normal page
+    config_confirmed: bool = False          # a site-side Cloudflare error seen on every visit
 
     @property
     def ok(self) -> bool:
@@ -128,6 +130,7 @@ def check_once(site, settings) -> UptimeResult:
     verdict = classify.classify_response(status, reply_headers, text)
     result.signal = verdict.signal
     result.marker = verdict.marker
+    result.cf_code = verdict.cf_code
     result.status_code = status
     result.response_time = elapsed
     result.final_url = final_url
@@ -252,10 +255,31 @@ def run_uptime_checks(sites, settings, cloudflare_seen_ids=(), sleep=time.sleep,
         final.cloudflare = any(a.cloudflare for a in site_attempts)
         final.verdict = classify.compute_verdict(site, site_attempts, seen_before, settings.retry_attempts)
         final.text_missing = site.site_id in confirmed_missing
-        if final.signal == classify.HTTP_ERROR and final.verdict != classify.VERDICT_DOWN:
-            final.note = f"HTTP {final.status_code}, the server answered so it counts as UP (page not scanned)"
+        final.config_confirmed = classify.config_error_confirmed(site_attempts, settings.retry_attempts)
+        final.note = _no_alert_note(site, final, seen_before)
         results[site.site_id] = final
     return results
+
+
+def _no_alert_note(site, final, seen_before: bool) -> Optional[str]:
+    """Plain-English reason shown in the table when a site gets no alert and is not clean UP."""
+    signal = final.signal
+    if final.verdict == classify.VERDICT_DOWN or signal in (classify.OK, *classify.INSPECTION_BLOCKED_SIGNALS):
+        return None
+    cloudflare_site = site.behind_cloudflare or seen_before or final.cloudflare
+    if signal == classify.HTTP_ERROR:
+        return f"HTTP {final.status_code}, the server answered but gave no usable page, so no alert (as before) and no content scan"
+    if signal == classify.TLS_WARN:
+        return "no response, certificate invalid, " + (
+            "no alert because Cloudflare site" if cloudflare_site else "warning email sent"
+        )
+    if signal == classify.CF_CONFIG_ERROR:
+        if final.config_confirmed:
+            return f"Cloudflare error {final.cf_code} confirmed on all visits, warning email sent"
+        return f"Cloudflare error {final.cf_code} seen but not on every visit, no alert"
+    if signal in (classify.TIMEOUT, classify.OTHER_FAIL):
+        return f"no response ({signal}), no alert on Cloudflare or externally monitored sites"
+    return None
 
 
 def _run_text_recheck(sites, attempts, settings, wait_for, sleep, clock) -> dict:

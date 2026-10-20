@@ -8,7 +8,10 @@ carries a cf-ray header, so origin errors are checked before challenges).
     2. CONN_FAIL         the TCP connection itself fails
        TLS_WARN          the certificate is invalid or expired (never DOWN)
     3. CF_ORIGIN_ERROR   HTTP 520-526 from the Cloudflare edge
-    4. CF_VISITOR_BLOCK  a Cloudflare 1xxx error page (never DOWN)
+    4. CF_VISITOR_BLOCK  a Cloudflare 1xxx page about the VISITOR (firewall rule, ban, rate
+                         limit). Never DOWN, never an alert.
+       CF_CONFIG_ERROR   a Cloudflare 1xxx page about the SITE (broken DNS or origin setup).
+                         Never DOWN, but a WARNING once 3 visits in a row confirm it.
     5. CHALLENGE         Cloudflare "checking your browser" style page (never DOWN)
     6. TIMEOUT           no answer within the time limit
        OTHER_FAIL        any other connection problem (redirect loop, reset ...)
@@ -27,6 +30,7 @@ CONN_FAIL = "CONN_FAIL"
 TLS_WARN = "TLS_WARN"
 CF_ORIGIN_ERROR = "CF_ORIGIN_ERROR"
 CF_VISITOR_BLOCK = "CF_VISITOR_BLOCK"
+CF_CONFIG_ERROR = "CF_CONFIG_ERROR"
 CHALLENGE = "CHALLENGE"
 TIMEOUT = "TIMEOUT"
 OTHER_FAIL = "OTHER_FAIL"
@@ -48,6 +52,37 @@ VERDICT_NOT_DOWN = "not_down"
 # 4xx answers that mean "the page is gone" count as DOWN on normal (non-Cloudflare) sites.
 BROKEN_PAGE_CODES = frozenset({404, 410})
 
+# Cloudflare 1xxx errors that are the SITE's own problem (broken DNS, origin, tunnel, Workers
+# or rewrite rules). Each maps to one plain sentence for the warning email. Checked against
+# Cloudflare's "1xxx errors" documentation (developers.cloudflare.com, support section).
+# Every OTHER 1xxx code is treated as a visitor block (silent), for example
+#   1003 direct IP access, 1005 ASN ban, 1006/1007/1008/1106 IP ban, 1009 country ban,
+#   1010 browser signature ban, 1011 hotlink protection, 1012 access denied,
+#   1013 hostname/SNI mismatch (caused by the visitor's browser or network),
+#   1015 rate limited, 1020 firewall rule.
+CF_CONFIG_ERRORS = {
+    1000: "A DNS record for this site points to a prohibited IP address, so Cloudflare refuses to serve it.",
+    1001: "Cloudflare cannot resolve the site's DNS, for example a CNAME that points to a domain that does not exist.",
+    1002: "A DNS record for this site points to a prohibited IP address, so Cloudflare refuses to serve it.",
+    1004: "Cloudflare says this host is not configured to serve web traffic (the proxy may be disabled or DNS changes have not spread yet).",
+    1014: "The site uses a CNAME to a domain on a different Cloudflare account, which Cloudflare forbids by default.",
+    1016: "Cloudflare cannot find the origin server because its DNS record is missing or points to a name that does not resolve.",
+    1018: "Cloudflare cannot find this host, usually because the domain was just activated or a DNS provider has an outage.",
+    1019: "Cloudflare reports a compute (Workers) server error for this site.",
+    1023: "Cloudflare cannot find this host, usually because the domain was just activated or a DNS provider has an outage.",
+    1025: "The site has reached its Cloudflare Workers plan limit, so requests are refused.",
+    1033: "The Cloudflare Tunnel that connects to the origin server is broken or offline.",
+    1034: "Cloudflare restricted the edge IP because the site's DNS points at 1.1.1.1 or another unsupported address.",
+    1035: "A Cloudflare rewrite rule on this site is invalid (bad URI path) and is breaking requests.",
+    1036: "A Cloudflare rewrite rule on this site is invalid (value too long) and is breaking requests.",
+    1037: "A Cloudflare rewrite rule on this site cannot be evaluated and is breaking requests.",
+    1040: "A Cloudflare rewrite rule on this site tries a header change that is not allowed and is breaking requests.",
+    1041: "A Cloudflare rewrite rule on this site sets an invalid header value and is breaking requests.",
+    1101: "The site's Cloudflare Worker crashed with an unhandled error.",
+    1102: "The site's Cloudflare Worker used too much CPU or memory.",
+    1200: "Cloudflare's queue for this site is full because too many requests are waiting.",
+}
+
 CHALLENGE_TEXT_MARKERS = (
     "just a moment",
     "attention required",
@@ -68,6 +103,7 @@ _SCAN_LIMIT = 200_000  # characters of a page we look at when hunting for marker
 class Classification:
     signal: str
     marker: Optional[str] = None   # name of what matched (never the page itself)
+    cf_code: Optional[int] = None  # the Cloudflare 1xxx code, if one was found
 
 
 def is_cloudflare(headers: dict) -> bool:
@@ -75,8 +111,8 @@ def is_cloudflare(headers: dict) -> bool:
     return "cf-ray" in headers or headers.get("server", "").lower() == "cloudflare"
 
 
-def find_visitor_block(status: int, headers: dict, body: str) -> Optional[str]:
-    """Cloudflare 1xxx error pages (1020, 1015, 1010 ...). Only looked for on error answers."""
+def find_cf_error_code(status: int, headers: dict, body: str) -> Optional[int]:
+    """The Cloudflare 1xxx code on an error page (1020, 1015, 1016 ...), or None."""
     if status < 400 or not body:
         return None
     text = body[:_SCAN_LIMIT]
@@ -85,7 +121,7 @@ def find_visitor_block(status: int, headers: dict, body: str) -> Optional[str]:
     for pattern in _CF_ERROR_PATTERNS:
         match = pattern.search(text)
         if match:
-            return f"cf-error-{match.group(1)}"
+            return int(match.group(1))
     return None
 
 
@@ -116,9 +152,11 @@ def classify_response(status: int, headers: dict, body: str) -> Classification:
     """Label an attempt that got an HTTP answer."""
     if 520 <= status <= 526 and is_cloudflare(headers):
         return Classification(CF_ORIGIN_ERROR)
-    marker = find_visitor_block(status, headers, body)
-    if marker:
-        return Classification(CF_VISITOR_BLOCK, marker)
+    code = find_cf_error_code(status, headers, body)
+    if code is not None:
+        if code in CF_CONFIG_ERRORS:
+            return Classification(CF_CONFIG_ERROR, f"cf-error-{code}", code)
+        return Classification(CF_VISITOR_BLOCK, f"cf-error-{code}", code)
     marker = find_challenge(status, headers, body)
     if marker:
         return Classification(CHALLENGE, marker)
@@ -183,12 +221,19 @@ def needs_another_attempt(site, attempts, cloudflare_seen: bool, needed: int) ->
     """Keep retrying only while every attempt so far could still add up to DOWN."""
     if len(attempts) >= needed:
         return False
+    if all(a.signal == CF_CONFIG_ERROR for a in attempts):
+        return True   # a site-side Cloudflare error is confirmed by seeing it 3 times in a row
     strict = is_strict(site, attempts, cloudflare_seen)
     if not all(down_eligible(a.signal, a.status_code, strict) for a in attempts):
         return False
     if strict and len({a.signal for a in attempts}) > 1:
         return False  # mixed kinds can never become DOWN, so do not waste time
     return True
+
+
+def config_error_confirmed(attempts, needed: int) -> bool:
+    """True when every one of `needed` visits showed a site-side Cloudflare error page."""
+    return len(attempts) >= needed and all(a.signal == CF_CONFIG_ERROR for a in attempts)
 
 
 def compute_verdict(site, attempts, cloudflare_seen: bool, needed: int) -> str:
