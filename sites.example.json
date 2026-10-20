@@ -3,7 +3,8 @@
     "name": "Example Client One",
     "url": "https://client-one.example.com",
     "expected_domain": "client-one.example.com",
-    "slow_threshold_seconds": 6
+    "slow_threshold_seconds": 6,
+    "read_timeout_seconds": 45
   },
   {
     "name": "Example Client Two (behind Cloudflare, uptime watched by an external monitor)",

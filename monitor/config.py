@@ -13,6 +13,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 log = logging.getLogger("monitor.config")
@@ -28,7 +29,8 @@ UPTIME_SOURCES = ("self", "external")
 # Settings that no longer do anything. If one is still set, say so once instead of ignoring it silently.
 REMOVED_SETTINGS = {
     "REQUEST_TIMEOUT_SECONDS": (
-        "is ignored. It is replaced by CONNECT_TIMEOUT_SECONDS (default 10) and READ_TIMEOUT_SECONDS (default 20)."
+        "is ignored. It is replaced by CONNECT_TIMEOUT_SECONDS (default 10) and READ_TIMEOUT_SECONDS (default 30), "
+        "and by \"read_timeout_seconds\" on a single site."
     ),
     "CLOUDFLARE_RETRY_GAP_SECONDS": (
         "is ignored. Every failing site now gets 3 visits at least RETRY_GAP_SECONDS (default 60) apart."
@@ -142,6 +144,7 @@ class Site:
     expected_domain: str
     keywords_to_watch: tuple = ()
     slow_threshold_seconds: float = 8.0
+    read_timeout_seconds: Optional[float] = None   # per-site override of how long to wait for an answer
     behind_cloudflare: bool = False     # the site is proxied by Cloudflare
     uptime_source: str = "self"         # "external" = another monitor owns uptime alerts
     expected_text: str = ""             # must appear on a normal 200 page (empty = not checked)
@@ -173,7 +176,7 @@ def load_settings() -> Settings:
         state_path=_env("STATE_PATH", "state.json"),
         healthcheck_url=_env("HEALTHCHECK_URL"),
         connect_timeout=_env_number("CONNECT_TIMEOUT_SECONDS", 10.0, float),
-        read_timeout=_env_number("READ_TIMEOUT_SECONDS", 20.0, float),
+        read_timeout=_env_number("READ_TIMEOUT_SECONDS", 30.0, float),
         retry_attempts=3,
         # Minimum time between the START of one attempt and the start of the next.
         retry_gap_seconds=_env_number("RETRY_GAP_SECONDS", 60.0, float),
@@ -277,6 +280,10 @@ def _parse_entry(settings: Settings, position: int, entry, seen_ids: set) -> Sit
         if not isinstance(entry.get(flag, False), bool):
             # A quoted "false" would count as true, so only real true/false is accepted.
             raise _EntryError(f"{where}: \"{flag}\" must be true or false (no quotes).")
+    read_timeout = entry.get("read_timeout_seconds")
+    if read_timeout is not None:
+        if isinstance(read_timeout, bool) or not isinstance(read_timeout, (int, float)) or not 0 < read_timeout <= 300:
+            raise _EntryError(f"{where}: \"read_timeout_seconds\" must be a number above 0 and at most 300.")
     uptime_source = entry.get("uptime_source", "self")
     if uptime_source not in UPTIME_SOURCES:
         raise _EntryError(f"{where}: \"uptime_source\" must be \"self\" or \"external\".")
@@ -293,6 +300,7 @@ def _parse_entry(settings: Settings, position: int, entry, seen_ids: set) -> Sit
         expected_domain=_normalize_domain(str(entry.get("expected_domain") or parsed.hostname)),
         keywords_to_watch=tuple(str(k).strip() for k in keywords if str(k).strip()),
         slow_threshold_seconds=slow,
+        read_timeout_seconds=float(read_timeout) if read_timeout is not None else None,
         behind_cloudflare=entry.get("behind_cloudflare", False),
         uptime_source=uptime_source,
         expected_text=expected_text.strip(),

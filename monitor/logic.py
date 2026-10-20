@@ -27,6 +27,7 @@ import math
 
 from .alerts import DOWN, RECOVERED, WARNING, Alert
 from .checks import classify as c
+from .checks.network import dns_words
 from .state import record_history
 from .timeutil import fmt_time, fmt_utc
 
@@ -320,7 +321,7 @@ def _evidence(result) -> list:
     probes = next((a.probes for a in reversed(attempts) if a.probes), None)
     if probes:
         for resolver, answer in probes.dns.items():
-            rows.append((f"DNS via {resolver}", answer))
+            rows.append((f"DNS via {resolver}", dns_words(answer)))
         rows.append((f"TCP port {probes.port}", probes.tcp))
         rows.append(("TLS handshake", probes.tls))
     rows.append(

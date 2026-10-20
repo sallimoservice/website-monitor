@@ -38,6 +38,17 @@ class Probes:
         return all(self.dns.get(name) in DEFINITE_DNS_FAILURES for name, _ in RESOLVERS)
 
 
+def dns_words(answer: str, short: bool = False) -> str:
+    """Plain words for a DNS answer. A failed lookup is OUR problem, not the site's."""
+    if answer == "ERROR":
+        return "not checked" if short else "not checked (lookup failed)"
+    if answer == "SERVFAIL":
+        return "SERVFAIL" if short else "SERVFAIL (the resolver could not get an answer)"
+    if answer == "n/a":
+        return "n/a" if short else "not needed (address given directly)"
+    return answer
+
+
 def _doh_query(url: str, host: str, record_type: str) -> str:
     """One DNS question. Returns OK, NXDOMAIN, NODATA, SERVFAIL or ERROR."""
     try:

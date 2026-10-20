@@ -22,6 +22,7 @@ from . import heartbeat
 from . import state as state_store
 from .alerts import CRASH, TEST, WARNING, Alert
 from .checks import classify
+from .checks.network import dns_words
 from .config import (
     ConfigError,
     load_dotenv,
@@ -37,6 +38,7 @@ from .notifiers import build_notifiers, dispatch
 log = logging.getLogger("monitor")
 
 CRASH_ALERT_COOLDOWN_SECONDS = 6 * 3600
+DNS_DEGRADED_THRESHOLD = 2   # more than this many sites with failed DNS lookups = "degraded"
 
 
 def _parse_args(argv):
@@ -155,9 +157,11 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
     log.info("Checking %d website(s)%s ...", len(sites), " (dry run, nothing will be sent)" if dry_run else "")
     results = run_uptime_checks(sites, settings, cloudflare_seen)
 
-    alerts, rows, internal_errors = [], [], 0
+    alerts, rows, advice, internal_errors = [], [], [], 0
     counts = Counter()
     paused, resumed, auto_detected = [], [], []
+    dns_lookup_failures = 0
+    unrecognised_codes = Counter()   # Cloudflare 1xxx codes we have no rule for, by number of sites
     for site in sites:
         result = results[site.site_id]
         if result is None:
@@ -177,7 +181,12 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
             resumed.append(site.name)
         if result.cloudflare and not site.behind_cloudflare:
             auto_detected.append(settings.log_name(site))
+        if _dns_lookup_failed(result):
+            dns_lookup_failures += 1
+        if result.signal == classify.CF_VISITOR_BLOCK and result.cf_code and not classify.is_recognised_cf_code(result.cf_code):
+            unrecognised_codes[str(result.cf_code)] += 1
         rows.append(_table_row(settings, site, result, site_state))
+        advice.append(_advice_row(settings, site, result))
         if settings.real_names_in_logs:   # per-site lines only on your own PC, never in public logs
             log.info("%-24s %-18s %s", settings.log_name(site), site_state["last_state"], _short_result(result))
 
@@ -194,11 +203,16 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
         "INSPECTION_BLOCKED": counts["INSPECTION_BLOCKED"],
         "mixed": counts["mixed"],
         "skipped_config": skipped,
+        # Read by the daily summary. A failed DNS lookup is never a DNS_FAIL, so if the lookups
+        # themselves stop working the DNS_FAIL signal goes quietly dead. This makes that visible.
+        "dns_lookup_failures": dns_lookup_failures,
+        "dns_degraded": dns_lookup_failures > DNS_DEGRADED_THRESHOLD,
+        "unrecognised_cf_codes": dict(unrecognised_codes),
     }
     _log_aggregate(stats)
 
     if dry_run:
-        _print_dry_run(settings, rows, alerts, auto_detected, stats)
+        _print_dry_run(settings, rows, advice, alerts, auto_detected, stats)
         return 1 if internal_errors else 0
 
     if alerts:
@@ -253,6 +267,14 @@ def _log_aggregate(stats) -> None:
     if stats["skipped_config"]:
         log.warning("%d site entr%s skipped because of config problems", stats["skipped_config"],
                     "y" if stats["skipped_config"] == 1 else "ies")
+    if stats["dns_degraded"]:
+        log.warning(
+            "DNS checking is degraded this run: the lookups to 1.1.1.1 and dns.google failed for %d sites, "
+            "so DNS_FAIL cannot fire until they work again",
+            stats["dns_lookup_failures"],
+        )
+    for code, count in sorted(stats["unrecognised_cf_codes"].items()):
+        log.info("unrecognised Cloudflare code %s seen on %d site%s", code, count, "" if count == 1 else "s")
 
 
 def _short_result(result) -> str:
@@ -280,6 +302,8 @@ def _table_row(settings, site, result, site_state) -> list:
         notes.append("expected_text missing (confirmed)")
     if site_state["refused_active"]:
         notes.append("refused connection counted as a warning")
+    if result.signal == classify.CF_VISITOR_BLOCK and result.cf_code and not classify.is_recognised_cf_code(result.cf_code):
+        notes.append(f"unrecognised Cloudflare code {result.cf_code} (silent, listed in the daily summary)")
     if site.uptime_source == "external":
         notes.append("uptime owned by external monitor")
     return [
@@ -287,7 +311,7 @@ def _table_row(settings, site, result, site_state) -> list:
         site_state["last_state"],
         "/".join(str(a.status_code) if a.status_code else "-" for a in attempts),
         "MIXED" if result.verdict == classify.VERDICT_MIXED else result.signal,
-        " / ".join(probes.dns.get(name, "-") for name in ("1.1.1.1", "8.8.8.8")) if probes else "-",
+        " / ".join(dns_words(probes.dns.get(name, "-"), short=True) for name in ("1.1.1.1", "8.8.8.8")) if probes else "-",
         probes.tcp if probes else "-",
         probes.tls if probes else "-",
         "/".join(f"{a.response_time * 1000:.0f}" if a.response_time is not None else "-" for a in attempts),
@@ -296,16 +320,65 @@ def _table_row(settings, site, result, site_state) -> list:
     ]
 
 
-def _print_dry_run(settings, rows, alerts, auto_detected, stats) -> None:
-    print()
-    widths = [max(len(TABLE_HEADERS[i]), *(len(row[i]) for row in rows)) if rows else len(TABLE_HEADERS[i])
-              for i in range(len(TABLE_HEADERS))]
+def _dns_lookup_failed(result) -> bool:
+    """True if our own DNS lookups (not the site's DNS) failed during any visit."""
+    return any(
+        a.probes is not None and any(answer == "ERROR" for answer in a.probes.dns.values())
+        for a in (result.attempt_log or [result])
+    )
+
+
+ADVICE_HEADERS = ["SITE", "CLOUDFLARE DETECTED", "HTTP SEEN", "WHAT TO SET IN SITES_JSON"]
+
+
+def _advice_row(settings, site, result) -> list:
+    """One line per site telling you which new settings it probably needs. Never edits anything."""
+    attempts = result.attempt_log or [result]
+    got_response = any(a.status_code is not None for a in attempts)
+    detected = "yes" if result.cloudflare else ("no" if got_response else "unknown (no response)")
+    todo = []
+    if result.verdict == classify.VERDICT_DOWN:
+        todo.append(f"failing now ({result.signal}), check this site first")
+    if result.cloudflare and not site.behind_cloudflare:
+        todo.append('"behind_cloudflare": true')
+    if site.behind_cloudflare and got_response and not result.cloudflare:
+        todo.append("behind_cloudflare is set but no Cloudflare headers were seen")
+    cannot_judge = result.signal in classify.INSPECTION_BLOCKED_SIGNALS or (
+        result.signal == classify.HTTP_ERROR and result.verdict != classify.VERDICT_DOWN
+    )
+    if cannot_judge and site.uptime_source != "external":
+        todo.append('"uptime_source": "external" if an external monitor covers it (GitHub cannot judge this site)')
+    if result.signal == classify.TLS_WARN and not (site.behind_cloudflare or result.cloudflare):
+        todo.append("certificate problem: fix the certificate, or set behind_cloudflare if Cloudflare issues it")
+    if not todo:
+        todo.append("nothing to change")
+    return [
+        settings.log_name(site),
+        detected,
+        "/".join(str(a.status_code) if a.status_code else "-" for a in attempts),
+        "; ".join(todo),
+    ]
+
+
+def _print_table(headers, rows) -> None:
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i]) for i in range(len(headers))]
     line = lambda cells: " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells)).rstrip()
-    print(line(TABLE_HEADERS))
+    print(line(headers))
     print("-+-".join("-" * w for w in widths))
     for row in rows:
         print(line(row))
+
+
+def _print_dry_run(settings, rows, advice, alerts, auto_detected, stats) -> None:
     print()
+    _print_table(TABLE_HEADERS, rows)
+    print()
+    print("SETTINGS HELP (suggestions only, nothing is changed for you)")
+    _print_table(ADVICE_HEADERS, advice)
+    print()
+    if stats["dns_degraded"]:
+        print(f"DNS checking is degraded: lookups failed for {stats['dns_lookup_failures']} site(s), "
+              "so DNS_FAIL cannot fire in this run.")
     if auto_detected:
         print(f"Cloudflare was detected on {len(auto_detected)} site(s) that do not have "
               f'"behind_cloudflare": true yet. Add it in SITES_JSON for  ' + ", ".join(auto_detected))

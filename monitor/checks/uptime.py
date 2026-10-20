@@ -80,13 +80,15 @@ def check_once(site, settings) -> UptimeResult:
     started_at = time.time()
     timer = time.perf_counter()
     headers = {**BASE_HEADERS, "User-Agent": settings.user_agent}
+    # A slow site can be given more room with "read_timeout_seconds" in SITES_JSON.
+    read_timeout = site.read_timeout_seconds or settings.read_timeout
     failure_kind = None
     response = None
     try:
         with requests.get(
             site.url,
             headers=headers,
-            timeout=(settings.connect_timeout, settings.read_timeout),
+            timeout=(settings.connect_timeout, read_timeout),
             allow_redirects=True,
             stream=True,
         ) as reply:
@@ -96,7 +98,7 @@ def check_once(site, settings) -> UptimeResult:
                 if len(body) >= MAX_BODY_BYTES:
                     break
                 # Total time limit, so a server that sends one byte at a time cannot stall us.
-                if time.perf_counter() - timer > settings.read_timeout * 2:
+                if time.perf_counter() - timer > read_timeout * 2:
                     raise requests.exceptions.ReadTimeout()
             response = (
                 reply.status_code,
@@ -126,7 +128,7 @@ def check_once(site, settings) -> UptimeResult:
 
     if response is None:
         result.signal = classify.classify_failure(failure_kind, probes)
-        result.error = _failure_text(result.signal, failure_kind, settings)
+        result.error = _failure_text(result.signal, failure_kind, read_timeout)
         return result
 
     status, reason, reply_headers, text, final_url = response
@@ -149,7 +151,7 @@ def check_once(site, settings) -> UptimeResult:
     return result
 
 
-def _failure_text(signal: str, kind: Optional[str], settings) -> str:
+def _failure_text(signal: str, kind: Optional[str], read_timeout: float) -> str:
     if signal == classify.DNS_FAIL:
         return "DNS lookup failed (domain not found)"
     if signal == classify.CONN_FAIL:
@@ -157,7 +159,7 @@ def _failure_text(signal: str, kind: Optional[str], settings) -> str:
     if signal == classify.TLS_WARN:
         return "SSL error (certificate problem)"
     if signal == classify.TIMEOUT:
-        return f"Timeout (no answer within {settings.read_timeout:g} seconds)"
+        return f"Timeout (no answer within {read_timeout:g} seconds)"
     if kind == "redirects":
         return "Too many redirects (redirect loop)"
     return "Request failed (connection problem)"

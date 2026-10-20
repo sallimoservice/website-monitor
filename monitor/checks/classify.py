@@ -83,6 +83,11 @@ CF_CONFIG_ERRORS = {
     1200: "Cloudflare's queue for this site is full because too many requests are waiting.",
 }
 
+# Visitor-side 1xxx codes we know about. They stay silent. Any 1xxx code that is in neither
+# this set nor CF_CONFIG_ERRORS is still silent, but is counted as "unrecognised" so the daily
+# summary can mention it (see is_recognised_cf_code).
+CF_VISITOR_BLOCK_CODES = frozenset({1003, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1015, 1020, 1106})
+
 CHALLENGE_TEXT_MARKERS = (
     "just a moment",
     "attention required",
@@ -109,6 +114,10 @@ class Classification:
 def is_cloudflare(headers: dict) -> bool:
     """True if the response came through Cloudflare. `headers` has lower-case names."""
     return "cf-ray" in headers or headers.get("server", "").lower() == "cloudflare"
+
+
+def is_recognised_cf_code(code) -> bool:
+    return code in CF_CONFIG_ERRORS or code in CF_VISITOR_BLOCK_CODES
 
 
 def find_cf_error_code(status: int, headers: dict, body: str) -> Optional[int]:
