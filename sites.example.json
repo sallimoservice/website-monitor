@@ -6,8 +6,11 @@
     "slow_threshold_seconds": 6
   },
   {
-    "name": "Example Client Two",
+    "name": "Example Client Two (behind Cloudflare, uptime watched by an external monitor)",
     "url": "https://client-two.example.org/",
+    "behind_cloudflare": true,
+    "uptime_source": "external",
+    "expected_text": "Book a ride",
     "connection_refused_is_warning": false,
     "keywords_to_watch": ["hacked by", "casino"]
   },

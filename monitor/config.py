@@ -9,10 +9,20 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
+
+log = logging.getLogger("monitor.config")
+
+# A normal desktop Chrome. Override with the USER_AGENT setting when browsers move on.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+UPTIME_SOURCES = ("self", "external")
 
 
 class ConfigError(Exception):
@@ -47,6 +57,13 @@ def _env(name: str, default: str = "") -> str:
     return value or default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env(name).lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
 def _env_number(name: str, default, cast):
     raw = _env(name)
     if not raw:
@@ -75,11 +92,16 @@ class Settings:
     state_salt: str
     state_path: str
     healthcheck_url: str
-    request_timeout: float
+    connect_timeout: float
+    read_timeout: float
     retry_attempts: int
     retry_gap_seconds: float
-    cloudflare_retry_gap_seconds: float
+    text_recheck_gap_seconds: float
     default_slow_seconds: float
+    check_every_hours: float
+    user_agent: str
+    notify_on_blocked_change: bool
+    dry_run: bool
     down_reminder_hours: float
     max_workers: int
     # Environment
@@ -108,6 +130,9 @@ class Site:
     expected_domain: str
     keywords_to_watch: tuple = ()
     slow_threshold_seconds: float = 8.0
+    behind_cloudflare: bool = False     # the site is proxied by Cloudflare
+    uptime_source: str = "self"         # "external" = another monitor owns uptime alerts
+    expected_text: str = ""             # must appear on a normal 200 page (empty = not checked)
     # Off by default. When true, "connection refused" on this site is a warning, not DOWN.
     connection_refused_is_warning: bool = False
 
@@ -135,12 +160,18 @@ def load_settings() -> Settings:
         state_salt=_env("STATE_SALT"),
         state_path=_env("STATE_PATH", "state.json"),
         healthcheck_url=_env("HEALTHCHECK_URL"),
-        request_timeout=_env_number("REQUEST_TIMEOUT_SECONDS", 30.0, float),
-        retry_attempts=4,
-        retry_gap_seconds=_env_number("RETRY_GAP_SECONDS", 15.0, float),
-        cloudflare_retry_gap_seconds=_env_number("CLOUDFLARE_RETRY_GAP_SECONDS", 30.0, float),
+        connect_timeout=_env_number("CONNECT_TIMEOUT_SECONDS", 10.0, float),
+        read_timeout=_env_number("READ_TIMEOUT_SECONDS", 20.0, float),
+        retry_attempts=3,
+        # Minimum time between the START of one attempt and the start of the next.
+        retry_gap_seconds=_env_number("RETRY_GAP_SECONDS", 60.0, float),
+        text_recheck_gap_seconds=_env_number("TEXT_RECHECK_GAP_SECONDS", 30.0, float),
         default_slow_seconds=_env_number("DEFAULT_SLOW_SECONDS", 8.0, float),
-        down_reminder_hours=6.0,
+        check_every_hours=_env_number("CHECK_EVERY_HOURS", 8.0, float),
+        user_agent=_env("USER_AGENT", DEFAULT_USER_AGENT),
+        notify_on_blocked_change=_env_bool("NOTIFY_ON_BLOCKED_CHANGE", False),
+        dry_run=_env_bool("DRY_RUN", False),
+        down_reminder_hours=8.0,
         max_workers=20,
         in_actions=in_actions,
         real_names_in_logs=real_names,
@@ -178,8 +209,73 @@ def _read_sites_json() -> str:
     )
 
 
-def load_sites(settings: Settings) -> list:
-    """Parse and validate the list of websites. Error messages never echo your data."""
+@dataclass
+class SiteLoad:
+    sites: list = field(default_factory=list)
+    skipped: int = 0                                  # entries ignored because they were malformed
+    skipped_ids: list = field(default_factory=list)   # their state IDs, so saved state is kept
+
+
+class _EntryError(Exception):
+    """One website entry is unusable. The other entries are not affected."""
+
+
+def _parse_entry(settings: Settings, position: int, entry, seen_ids: set) -> Site:
+    where = f"Website number {position} in SITES_JSON"
+    if not isinstance(entry, dict):
+        raise _EntryError(f"{where} must be an object like {{\"name\": ..., \"url\": ...}}.")
+    name = str(entry.get("name", "")).strip()
+    url = str(entry.get("url", "")).strip()
+    if not name:
+        raise _EntryError(f"{where} is missing \"name\".")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise _EntryError(f"{where} needs a \"url\" starting with http:// or https://.")
+    site_id = make_site_id(settings.state_salt, url)
+    if site_id in seen_ids:
+        raise _EntryError(f"{where} repeats a URL that is already in the list.")
+
+    keywords = entry.get("keywords_to_watch", [])
+    if not isinstance(keywords, list):
+        raise _EntryError(f"{where}: \"keywords_to_watch\" must be a list of words.")
+    try:
+        slow = float(entry.get("slow_threshold_seconds", settings.default_slow_seconds))
+    except (TypeError, ValueError):
+        raise _EntryError(f"{where}: \"slow_threshold_seconds\" must be a number.") from None
+    if slow <= 0:
+        raise _EntryError(f"{where}: \"slow_threshold_seconds\" must be above 0.")
+    for flag in ("connection_refused_is_warning", "behind_cloudflare"):
+        if not isinstance(entry.get(flag, False), bool):
+            # A quoted "false" would count as true, so only real true/false is accepted.
+            raise _EntryError(f"{where}: \"{flag}\" must be true or false (no quotes).")
+    uptime_source = entry.get("uptime_source", "self")
+    if uptime_source not in UPTIME_SOURCES:
+        raise _EntryError(f"{where}: \"uptime_source\" must be \"self\" or \"external\".")
+    expected_text = entry.get("expected_text", "")
+    if not isinstance(expected_text, str):
+        raise _EntryError(f"{where}: \"expected_text\" must be text.")
+
+    seen_ids.add(site_id)
+    return Site(
+        index=position,
+        name=name,
+        url=url,
+        site_id=site_id,
+        expected_domain=_normalize_domain(str(entry.get("expected_domain") or parsed.hostname)),
+        keywords_to_watch=tuple(str(k).strip() for k in keywords if str(k).strip()),
+        slow_threshold_seconds=slow,
+        behind_cloudflare=entry.get("behind_cloudflare", False),
+        uptime_source=uptime_source,
+        expected_text=expected_text.strip(),
+        connection_refused_is_warning=entry.get("connection_refused_is_warning", False),
+    )
+
+
+def load_sites_report(settings: Settings) -> SiteLoad:
+    """Parse the website list. A broken entry is skipped (and counted), never fatal.
+
+    Only a list that cannot be read at all stops the run. Messages never echo your data.
+    """
     try:
         data = json.loads(_read_sites_json())
     except json.JSONDecodeError as exc:
@@ -190,47 +286,20 @@ def load_sites(settings: Settings) -> list:
     if not isinstance(data, list) or not data:
         raise ConfigError("SITES_JSON must be a JSON list with at least one website.")
 
-    sites, seen_urls = [], set()
+    report, seen_ids = SiteLoad(), set()
     for position, entry in enumerate(data, start=1):
-        where = f"Website number {position} in SITES_JSON"
-        if not isinstance(entry, dict):
-            raise ConfigError(f"{where} must be an object like {{\"name\": ..., \"url\": ...}}.")
-        name = str(entry.get("name", "")).strip()
-        url = str(entry.get("url", "")).strip()
-        if not name:
-            raise ConfigError(f"{where} is missing \"name\".")
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ConfigError(f"{where} needs a \"url\" starting with http:// or https://.")
-        site_id = make_site_id(settings.state_salt, url)
-        if site_id in seen_urls:
-            raise ConfigError(f"{where} repeats a URL that is already in the list.")
-        seen_urls.add(site_id)
-
-        keywords = entry.get("keywords_to_watch", [])
-        if not isinstance(keywords, list):
-            raise ConfigError(f"{where}: \"keywords_to_watch\" must be a list of words.")
         try:
-            slow = float(entry.get("slow_threshold_seconds", settings.default_slow_seconds))
-        except (TypeError, ValueError):
-            raise ConfigError(f"{where}: \"slow_threshold_seconds\" must be a number.") from None
-        if slow <= 0:
-            raise ConfigError(f"{where}: \"slow_threshold_seconds\" must be above 0.")
-        refused_is_warning = entry.get("connection_refused_is_warning", False)
-        if not isinstance(refused_is_warning, bool):
-            # A quoted "false" would count as true, so only real true/false is accepted.
-            raise ConfigError(f"{where}: \"connection_refused_is_warning\" must be true or false (no quotes).")
+            report.sites.append(_parse_entry(settings, position, entry, seen_ids))
+        except _EntryError as exc:
+            report.skipped += 1
+            log.warning("Entry skipped. %s", exc)
+            if isinstance(entry, dict) and isinstance(entry.get("url"), str) and entry["url"].strip():
+                report.skipped_ids.append(make_site_id(settings.state_salt, entry["url"]))
+    if not report.sites:
+        raise ConfigError("None of the websites in SITES_JSON could be used. See the warnings above.")
+    return report
 
-        sites.append(
-            Site(
-                index=position,
-                name=name,
-                url=url,
-                site_id=site_id,
-                expected_domain=_normalize_domain(str(entry.get("expected_domain") or parsed.hostname)),
-                keywords_to_watch=tuple(str(k).strip() for k in keywords if str(k).strip()),
-                slow_threshold_seconds=slow,
-                connection_refused_is_warning=refused_is_warning,
-            )
-        )
-    return sites
+
+def load_sites(settings: Settings) -> list:
+    """The usable websites only (see load_sites_report for the skipped count)."""
+    return load_sites_report(settings).sites

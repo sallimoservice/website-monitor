@@ -16,15 +16,16 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 
 from . import heartbeat
 from . import state as state_store
-from .alerts import CRASH, TEST, Alert
-from .config import ConfigError, load_dotenv, load_settings, load_sites
+from .alerts import CRASH, TEST, WARNING, Alert
+from .checks import classify
+from .config import ConfigError, load_dotenv, load_settings, load_sites, load_sites_report
 from .log import mask_in_actions, register_sensitive, setup_logging
-from .logic import apply_delivery, evaluate_uptime, started_alert
+from .logic import apply_delivery, evaluate_uptime
 from .notifiers import build_notifiers, dispatch
-from .timeutil import fmt_time
 
 log = logging.getLogger("monitor")
 
@@ -50,7 +51,7 @@ def _protect_sites(settings, sites) -> None:
     """Hide client names, URLs and domains from public logs (not when testing on your PC)."""
     values = []
     for site in sites:
-        values.extend([site.name, site.url, site.host, site.expected_domain])
+        values.extend([site.name, site.url, site.host, site.expected_domain, site.expected_text])
     if not settings.real_names_in_logs:
         register_sensitive(values)
     if settings.in_actions:
@@ -128,33 +129,67 @@ def run_notify_crash(settings) -> int:
 # --------------------------------------------------------------------------------------
 # normal run and --dry-run
 # --------------------------------------------------------------------------------------
-def run_checks(settings, sites, dry_run: bool) -> int:
+def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -> int:
     from .checks.uptime import run_uptime_checks  # imported here so --notify-crash needs no packages
 
     started = time.time()
     state = state_store.load_state(settings.state_path)
-    removed = state_store.prune_removed_sites(state, [s.site_id for s in sites])
+    # Sites skipped for a config typo keep their saved state, so a typo cannot wipe a baseline.
+    removed = state_store.prune_removed_sites(state, [s.site_id for s in sites] + list(keep_ids))
     if removed:
         log.info("Forgot the saved state of %d removed website(s).", removed)
+    if state.get("_fresh"):
+        log.info("Saved state was missing, so everything is learned from scratch (no change alerts this run).")
+    cloudflare_seen = {
+        site.site_id for site in sites if state_store.get_site_state(state, site.site_id)["cloudflare_seen"]
+    }
 
     log.info("Checking %d website(s)%s ...", len(sites), " (dry run, nothing will be sent)" if dry_run else "")
-    results = run_uptime_checks(sites, settings)
+    results = run_uptime_checks(sites, settings, cloudflare_seen)
 
-    alerts, internal_errors = [], 0
+    alerts, rows, internal_errors = [], [], 0
+    counts = Counter()
+    paused, resumed, auto_detected = [], [], []
     for site in sites:
         result = results[site.site_id]
         if result is None:
             internal_errors += 1
             continue
         site_state = state_store.get_site_state(state, site.site_id)
+        was_blocked = site_state["inspection_blocked"]
         alerts.extend(evaluate_uptime(site, site_state, result, started, settings))
-        _log_site_result(settings, site, result, site_state)
 
-    if sites and not state["meta"].get("started_notified"):
-        alerts.append(started_alert(len(sites), started))
+        counts[site_state["last_state"]] += 1
+        if result.verdict == classify.VERDICT_MIXED:
+            counts["mixed"] += 1
+        if result.signal in classify.INSPECTION_BLOCKED_SIGNALS:
+            if not was_blocked:
+                paused.append(site.name)   # emails are private, so real names are fine here
+        elif result.signal == classify.OK and was_blocked:
+            resumed.append(site.name)
+        if result.cloudflare and not site.behind_cloudflare:
+            auto_detected.append(settings.log_name(site))
+        rows.append(_table_row(settings, site, result, site_state))
+        if settings.real_names_in_logs:   # per-site lines only on your own PC, never in public logs
+            log.info("%-24s %-18s %s", settings.log_name(site), site_state["last_state"], _short_result(result))
+
+    if settings.notify_on_blocked_change and not state.get("_fresh") and (paused or resumed):
+        alerts.append(_scan_change_alert(paused, resumed, started))
+
+    stats = {
+        "sites": len(sites),
+        "UP": counts["UP"],
+        "SLOW": counts["SLOW"],
+        "DOWN": counts["DOWN"],
+        "WARNING": counts["WARNING"],
+        "INSPECTION_BLOCKED": counts["INSPECTION_BLOCKED"],
+        "mixed": counts["mixed"],
+        "skipped_config": skipped,
+    }
+    _log_aggregate(stats)
 
     if dry_run:
-        _print_dry_run_summary(settings, alerts)
+        _print_dry_run(settings, rows, alerts, auto_detected, stats)
         return 1 if internal_errors else 0
 
     if alerts:
@@ -171,6 +206,7 @@ def run_checks(settings, sites, dry_run: bool) -> int:
                     log.warning("An alert was not delivered and will be retried on the next run.")
 
     state["meta"]["last_run"] = started
+    state["meta"]["last_run_stats"] = stats      # read by the daily summary
     state_store.save_state(settings.state_path, state)
     log.info("Done in %.1fs.", time.time() - started)
 
@@ -181,20 +217,92 @@ def run_checks(settings, sites, dry_run: bool) -> int:
     return 0
 
 
-def _log_site_result(settings, site, result, site_state) -> None:
-    name = settings.log_name(site)
-    if result.ok:
-        extra = f" ({result.note})" if result.note else ""
-        log.info("%-9s UP    HTTP %s  %.2fs%s", name, result.status_code, result.response_time or 0, extra)
-    elif site_state.get("refused_active"):
-        log.warning("%-9s WARN  %s (warning only, not DOWN, by this site's setting)", name, result.error)
-    else:
-        since = fmt_time(site_state["down_since"]) if site_state.get("down_since") else "now"
-        log.warning("%-9s DOWN  %s (down since %s)", name, result.error, since)
+def _scan_change_alert(paused, resumed, now) -> Alert:
+    parts = []
+    details = []
+    if paused:
+        parts.append(f"Content scanning paused for {len(paused)} site{'s' if len(paused) != 1 else ''}")
+        details.append(("Paused", ", ".join(paused)))
+    if resumed:
+        parts.append(f"content scanning resumed for {len(resumed)} site{'s' if len(resumed) != 1 else ''}")
+        details.append(("Resumed", ", ".join(resumed)))
+    summary = " and ".join(parts)
+    return Alert(kind=WARNING, site_name="Website Monitor", url="", summary=summary[0].upper() + summary[1:] + ".",
+                 details=details, ts=now)
 
 
-def _print_dry_run_summary(settings, alerts) -> None:
+def _log_aggregate(stats) -> None:
+    """The only per-run summary that goes into public logs: counts, never names."""
+    log.info(
+        "%d site(s) checked: %d UP, %d SLOW, %d DOWN, %d WARNING",
+        stats["sites"], stats["UP"], stats["SLOW"], stats["DOWN"], stats["WARNING"],
+    )
+    if stats["INSPECTION_BLOCKED"]:
+        log.info("%d sites inspection-blocked", stats["INSPECTION_BLOCKED"])
+    if stats["mixed"]:
+        log.info("%d site(s) showed mixed failure signals: no alert, will look again next run", stats["mixed"])
+    if stats["skipped_config"]:
+        log.warning("%d site entr%s skipped because of config problems", stats["skipped_config"],
+                    "y" if stats["skipped_config"] == 1 else "ies")
+
+
+def _short_result(result) -> str:
+    code = result.status_code if result.status_code else "-"
+    ms = f"{result.response_time * 1000:.0f}ms" if result.response_time is not None else "-"
+    return f"{result.signal} HTTP {code} {ms}" + (" (mixed signals)" if result.verdict == classify.VERDICT_MIXED else "")
+
+
+TABLE_HEADERS = ["SITE", "STATE", "HTTP", "SIGNAL", "DNS(1.1.1.1 / 8.8.8.8)", "TCP443", "TLS", "MS", "ATTEMPT TIMES (UTC)", "NOTE"]
+
+
+def _table_row(settings, site, result, site_state) -> list:
+    attempts = result.attempt_log or [result]
+    probes = next((a.probes for a in reversed(attempts) if a.probes), None)
+    notes = []
+    if result.verdict == classify.VERDICT_MIXED:
+        notes.append("mixed failure signals, no alert, re-check next run")
+    if result.cloudflare and not site.behind_cloudflare:
+        notes.append("Cloudflare detected, set behind_cloudflare=true")
+    if result.marker:
+        notes.append(f"matched {result.marker}")
+    if result.note:
+        notes.append(result.note)
+    if result.text_missing:
+        notes.append("expected_text missing (confirmed)")
+    if site_state["refused_active"]:
+        notes.append("refused connection counted as a warning")
+    if site.uptime_source == "external":
+        notes.append("uptime owned by external monitor")
+    return [
+        settings.log_name(site),
+        site_state["last_state"],
+        "/".join(str(a.status_code) if a.status_code else "-" for a in attempts),
+        "MIXED" if result.verdict == classify.VERDICT_MIXED else result.signal,
+        " / ".join(probes.dns.get(name, "-") for name in ("1.1.1.1", "8.8.8.8")) if probes else "-",
+        probes.tcp if probes else "-",
+        probes.tls if probes else "-",
+        "/".join(f"{a.response_time * 1000:.0f}" if a.response_time is not None else "-" for a in attempts),
+        "/".join(time.strftime("%H:%M:%S", time.gmtime(a.started_at)) for a in attempts),
+        "; ".join(notes) or "-",
+    ]
+
+
+def _print_dry_run(settings, rows, alerts, auto_detected, stats) -> None:
     print()
+    widths = [max(len(TABLE_HEADERS[i]), *(len(row[i]) for row in rows)) if rows else len(TABLE_HEADERS[i])
+              for i in range(len(TABLE_HEADERS))]
+    line = lambda cells: " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells)).rstrip()
+    print(line(TABLE_HEADERS))
+    print("-+-".join("-" * w for w in widths))
+    for row in rows:
+        print(line(row))
+    print()
+    if auto_detected:
+        print(f"Cloudflare was detected on {len(auto_detected)} site(s) that do not have "
+              f'"behind_cloudflare": true yet. Add it in SITES_JSON for  ' + ", ".join(auto_detected))
+    if stats["skipped_config"]:
+        print(f"{stats['skipped_config']} entr{'y' if stats['skipped_config'] == 1 else 'ies'} in SITES_JSON "
+              "skipped because of config problems (see the warnings above).")
     if not alerts:
         print("No alerts would be sent.")
         return
@@ -217,10 +325,16 @@ def main(argv=None) -> int:
             return run_test_alert(settings)
         if args.notify_crash:
             return run_notify_crash(settings)
-        sites = load_sites(settings)
-        _protect_sites(settings, sites)
+        load = load_sites_report(settings)
+        _protect_sites(settings, load.sites)
         _warn_about_missing_basics(settings)
-        return run_checks(settings, sites, dry_run=args.dry_run)
+        return run_checks(
+            settings,
+            load.sites,
+            dry_run=args.dry_run or settings.dry_run,
+            skipped=load.skipped,
+            keep_ids=load.skipped_ids,
+        )
     except ConfigError as exc:
         log.error("Settings problem. %s", exc)
         return 2

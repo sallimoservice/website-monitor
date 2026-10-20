@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 TIMEZONE = ZoneInfo("Asia/Karachi")
@@ -11,6 +11,11 @@ TIMEZONE = ZoneInfo("Asia/Karachi")
 def fmt_time(timestamp: float) -> str:
     """Format a Unix timestamp like '19 Oct 2026, 03:45 PM PKT'."""
     return datetime.fromtimestamp(timestamp, TIMEZONE).strftime("%d %b %Y, %I:%M %p PKT")
+
+
+def fmt_utc(timestamp: float) -> str:
+    """Format a Unix timestamp like '2026-10-19 10:45:03 UTC'."""
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def fmt_duration(seconds: float) -> str:

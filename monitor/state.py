@@ -15,13 +15,28 @@ import tempfile
 import time
 from pathlib import Path
 
+from .checks.classify import SCANNABLE_SIGNALS
+
 log = logging.getLogger("monitor.state")
 
-STATE_VERSION = 1
+# Version 2 only ADDS fields, so a saved version 1 file still loads (missing fields get defaults).
+STATE_VERSION = 2
 HISTORY_SECONDS = 25 * 3600  # keep a little over 24h of check results for the daily summary
 
 DEFAULT_SITE_STATE = {
-    "status": "unknown",        # unknown / up / down
+    "status": "unknown",        # unknown / up / down (the outage tracker)
+    "last_state": "UP",         # UP / SLOW / DOWN / INSPECTION_BLOCKED / WARNING as of the last run
+    "last_up_at": None,         # last time the site gave a clean "up" answer
+    "down_signal": None,        # what kind of failure started the outage (DNS_FAIL, CONN_FAIL ...)
+    "down_inconclusive_since": None,  # outage still open, but only challenge/error pages seen since
+    "inspection_blocked": False,      # last page could not be used for content checks
+    "cloudflare_seen": False,   # a response ever came through Cloudflare (sticky)
+    "tls_warn_active": False,   # a certificate warning is in effect
+    "last_tls_alert": None,
+    "text_missing_active": False,     # expected_text is confirmed missing
+    "last_text_alert": None,
+    "baseline_hash": None,      # content fingerprint of a CLEAN page (see store_baseline)
+    "baseline_learned_at": None,
     "down_since": None,         # when the current outage was first seen
     "down_notified_at": None,   # when we last delivered a DOWN alert or reminder
     "pending_recovery": None,   # a RECOVERED alert that has not been delivered yet
@@ -34,7 +49,9 @@ DEFAULT_SITE_STATE = {
 
 
 def _fresh_state() -> dict:
-    return {"version": STATE_VERSION, "meta": {"created": time.time()}, "sites": {}}
+    # "_fresh" lives only in memory for this run (it is never written to disk). It tells the
+    # content checks that every baseline is being learned from scratch, so they must stay quiet.
+    return {"version": STATE_VERSION, "meta": {"created": time.time()}, "sites": {}, "_fresh": True}
 
 
 def load_state(path: str) -> dict:
@@ -57,6 +74,7 @@ def load_state(path: str) -> dict:
 def save_state(path: str, state: dict) -> None:
     """Write state.json safely: write a temp file first, then swap it in."""
     state["version"] = STATE_VERSION
+    state = {key: value for key, value in state.items() if key != "_fresh"}
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=target.parent or ".", prefix=".state-", suffix=".tmp")
@@ -92,3 +110,19 @@ def record_history(site_state: dict, now: float, ok: bool, response_ms) -> None:
     history.append([int(now), 1 if ok else 0, response_ms])
     cutoff = now - HISTORY_SECONDS
     site_state["history"] = [row for row in history if row[0] >= cutoff]
+
+
+def store_baseline(site_state: dict, result, fingerprint: str, now: float) -> bool:
+    """The ONLY way to create or replace a content baseline.
+
+    A baseline may only come from a clean, normal 200 page. A challenge, a Cloudflare
+    block page or any error page is refused, and an existing baseline is left untouched.
+    Returns True if the baseline was saved.
+    """
+    if result.signal not in SCANNABLE_SIGNALS or result.status_code != 200 or result.body is None:
+        return False
+    if not fingerprint:
+        return False
+    site_state["baseline_hash"] = fingerprint
+    site_state["baseline_learned_at"] = now
+    return True
