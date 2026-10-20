@@ -68,6 +68,14 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          # Optional settings. Add them as repository VARIABLES (not secrets):
+          # Settings > Secrets and variables > Actions > Variables. Empty means "use the default".
+          NOTIFY_ON_BLOCKED_CHANGE: ${{ vars.NOTIFY_ON_BLOCKED_CHANGE }}
+          USER_AGENT: ${{ vars.USER_AGENT }}
+          RETRY_GAP_SECONDS: ${{ vars.RETRY_GAP_SECONDS }}
+          # Removed settings. They are passed on only so the monitor can log that they are ignored.
+          REQUEST_TIMEOUT_SECONDS: ${{ vars.REQUEST_TIMEOUT_SECONDS }}
+          CLOUDFLARE_RETRY_GAP_SECONDS: ${{ vars.CLOUDFLARE_RETRY_GAP_SECONDS }}
           DRY_RUN: ${{ inputs.dry_run }}
           TEST_ALERT: ${{ inputs.test_alert }}
         run: |
