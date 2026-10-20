@@ -1,8 +1,6 @@
 name: Website Monitor
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"        # every 5 minutes (GitHub may start it a few minutes late)
   workflow_dispatch:             # the "Run workflow" button
     inputs:
       dry_run:
