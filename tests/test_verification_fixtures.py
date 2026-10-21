@@ -30,10 +30,19 @@ class FixtureClockTests(unittest.TestCase):
         import sys
         import time
 
+        # Use a work folder of its own. Never touch the one the suite runner shares between suites.
+        saved = os.environ.pop("SP", None)
         sys.path.insert(0, str(VERIFICATION))
+        sys.modules.pop("_paths", None)
         import _paths   # builds a throw-away work folder, fake certificate included
 
-        self.addCleanup(lambda: shutil.rmtree(os.environ.pop("SP", _paths.SP), ignore_errors=True))
+        def cleanup():
+            shutil.rmtree(_paths.SP, ignore_errors=True)
+            os.environ.pop("SP", None)
+            if saved is not None:
+                os.environ["SP"] = saved
+
+        self.addCleanup(cleanup)
 
         state = json.loads((VERIFICATION / "fixtures" / "state_old_v1.json").read_text(encoding="utf-8"))
         aged = _paths.age_state(state, 3 * 86400)
