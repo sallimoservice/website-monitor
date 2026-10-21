@@ -303,6 +303,11 @@ def _origin_warning(site, site_state, result, now, settings) -> list:
     attempts = result.attempt_log or [result]
     seen = ", ".join(f"HTTP {a.status_code}" if a.status_code else "no answer (timeout)" for a in attempts)
 
+    extra = []
+    if any(a.status_code == 520 for a in attempts):
+        extra = [("About HTTP 520", "Cloudflare got an empty or unexpected answer from the server. The server may be failing, "
+                  "or its firewall may be rejecting this monitor while real visitors are fine. Open the site in a browser to tell which.")]
+
     def make():
         return Alert(
             kind=WARNING,
@@ -313,6 +318,7 @@ def _origin_warning(site, site_state, result, now, settings) -> list:
                 f"the result was {seen}."
             ),
             details=[("Checks", f"{len(attempts)} visits, at least {settings.retry_gap_seconds:g} seconds apart, all in trouble")]
+            + extra
             + _evidence(result),
             ts=now,
             tag="origin",

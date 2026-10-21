@@ -155,6 +155,8 @@ def check_once(site, settings) -> UptimeResult:
     result.cloudflare = classify.is_cloudflare(reply_headers)
     if result.signal == classify.OK:
         result.body = text   # a clean page only; `text` is dropped for every other signal
+    elif result.signal == classify.CF_ORIGIN_UNKNOWN:
+        result.error = "Cloudflare error 520 (the server gave Cloudflare an empty or unexpected answer)"
     elif result.signal == classify.CF_ORIGIN_ERROR:
         result.error = f"Cloudflare error {status} (Cloudflare cannot get a good answer from the server)"
     elif result.signal == classify.ORIGIN_5XX:

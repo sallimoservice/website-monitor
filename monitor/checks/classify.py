@@ -7,7 +7,11 @@ carries a cf-ray header, so origin errors are checked before challenges).
     1. DNS_FAIL          both 1.1.1.1 and 8.8.8.8 say the domain does not exist
     2. CONN_FAIL         the TCP connection itself fails
        TLS_WARN          the certificate is invalid or expired (never DOWN)
-    3. CF_ORIGIN_ERROR   HTTP 520-526 from the Cloudflare edge
+    3. CF_ORIGIN_ERROR   HTTP 521-526 from the Cloudflare edge (origin refused, timed out, unreachable,
+                         or has a broken certificate: visitors see it too)
+       CF_ORIGIN_UNKNOWN HTTP 520 from the Cloudflare edge. "Empty or unexpected answer" can be the
+                         origin's firewall rejecting only OUR request while visitors are fine, so it
+                         is a WARNING after 3 visits in a row and never DOWN.
     4. CF_VISITOR_BLOCK  a Cloudflare 1xxx page about the VISITOR (firewall rule, ban, rate
                          limit). Never DOWN, never an alert.
        CF_CONFIG_ERROR   a Cloudflare 1xxx page about the SITE (broken DNS or origin setup).
@@ -35,6 +39,7 @@ DNS_FAIL = "DNS_FAIL"
 CONN_FAIL = "CONN_FAIL"
 TLS_WARN = "TLS_WARN"
 CF_ORIGIN_ERROR = "CF_ORIGIN_ERROR"
+CF_ORIGIN_UNKNOWN = "CF_ORIGIN_UNKNOWN"
 CF_VISITOR_BLOCK = "CF_VISITOR_BLOCK"
 CF_CONFIG_ERROR = "CF_CONFIG_ERROR"
 ORIGIN_5XX = "ORIGIN_5XX"
@@ -52,7 +57,7 @@ INSPECTION_BLOCKED_SIGNALS = frozenset({CHALLENGE, CF_VISITOR_BLOCK})
 # Signals that all mean "the server behind Cloudflare is in trouble". On a Cloudflare site that is
 # not covered by an external monitor, three visits in a row from this family give a WARNING (all
 # CF_ORIGIN_ERROR is still a DOWN). A mix such as 522, then 504, then a timeout is still trouble.
-ORIGIN_TROUBLE_SIGNALS = frozenset({CF_ORIGIN_ERROR, ORIGIN_5XX, TIMEOUT})
+ORIGIN_TROUBLE_SIGNALS = frozenset({CF_ORIGIN_ERROR, CF_ORIGIN_UNKNOWN, ORIGIN_5XX, TIMEOUT})
 # Only a clean normal page may be used for content checks or saved as a baseline.
 SCANNABLE_SIGNALS = frozenset({OK})
 
@@ -182,7 +187,9 @@ def find_challenge(status: int, headers: dict, body: str) -> Optional[str]:
 
 def classify_response(status: int, headers: dict, body: str) -> Classification:
     """Label an attempt that got an HTTP answer."""
-    if 520 <= status <= 526 and is_cloudflare(headers):
+    if status == 520 and is_cloudflare(headers):
+        return Classification(CF_ORIGIN_UNKNOWN)
+    if 521 <= status <= 526 and is_cloudflare(headers):
         return Classification(CF_ORIGIN_ERROR)
     code = find_cf_error_code(status, headers, body)
     if code is not None:
