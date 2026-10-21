@@ -1,23 +1,31 @@
-"""Uptime check. Visits a website and decides whether it is up or down."""
+"""Uptime check. Visits each website, labels what happened, and decides if it is DOWN.
+
+How a run works
+  Round 1  every website is visited once, all at the same time.
+  Round 2  only websites whose visit looked like a real outage are visited again,
+           at least 60 seconds after the START of their previous visit.
+  Round 3  the same again for websites that are still failing.
+A website is only DOWN when all three visits agree (see classify.compute_verdict).
+"""
 
 from __future__ import annotations
 
 import logging
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import requests
 
+from . import classify
+from .network import Probes, run_probes
+
 log = logging.getLogger("monitor.uptime")
 
-# Headers of a normal desktop Chrome browser, so firewalls do not treat the monitor as a bot.
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-    ),
+# Headers of a normal desktop Chrome browser. The User-Agent comes from the settings.
+BASE_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
         "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
@@ -26,46 +34,47 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 MAX_BODY_BYTES = 2_000_000
-
-# Cloudflare's "I could not get a good answer from the website's server" codes.
-# These are often short hiccups or bot blocks, so they get one patient retry before we alert.
-CLOUDFLARE_CODES = {520, 521, 522, 523, 524}
-
-_DNS_HINTS = (
-    "name or service not known",
-    "nodename nor servname",
-    "getaddrinfo failed",
-    "temporary failure in name resolution",
-    "nameresolutionerror",
-    "no address associated",
-)
+# After a visit ends, wait at least this long (or the retry gap if that is shorter) before the
+# next visit to the same site. A site that just timed out is never hit again straight away.
+MIN_REST_SECONDS = 15.0
+_rng = random.Random()
 
 
 @dataclass
 class UptimeResult:
-    ok: bool
+    """One visit (attempt). The final result of a site also carries all its attempts."""
+
+    signal: str = classify.OTHER_FAIL
     status_code: Optional[int] = None
     response_time: Optional[float] = None   # seconds
-    error: Optional[str] = None             # plain-English reason when not ok
-    attempts: int = 1
+    error: Optional[str] = None             # plain-English reason when something failed
+    started_at: float = 0.0                 # Unix time this visit began
+    finished_at: float = 0.0                # Unix time this visit ended (evidence collected)
     final_url: Optional[str] = None         # where we ended up after redirects
-    body: Optional[str] = None              # page HTML, reused by the security checks
+    # Page HTML for the content checks. ONLY kept for a clean normal page. A challenge,
+    # block or error page is dropped inside check_once and never stored anywhere.
+    body: Optional[str] = None
     note: Optional[str] = None              # extra remark for the log (never changes up/down)
-    # What kind of failure it was: http, timeout, dns, ssl, connection, redirects or request.
-    error_kind: Optional[str] = None
+    cf_ray: Optional[str] = None
+    cf_mitigated: Optional[str] = None
+    marker: Optional[str] = None            # name of the challenge marker that matched
+    cf_code: Optional[int] = None           # Cloudflare 1xxx code, when the page showed one
+    server: Optional[str] = None            # the "Server" header (for spotting shared hosting)
+    cloudflare: bool = False                # the answer came through Cloudflare
+    probes: Optional[Probes] = None
+    # Filled in on the final result of a site:
+    attempts: int = 1
+    requests_made: int = 1                  # page visits for this site this run, including the text re-check
+    attempt_log: list = field(default_factory=list, repr=False)
+    verdict: str = classify.VERDICT_NOT_DOWN
+    strict: bool = False
+    text_missing: bool = False              # expected_text confirmed missing on a normal page
+    config_confirmed: bool = False          # a site-side Cloudflare error seen on every visit
+    origin_trouble_confirmed: bool = False  # origin errors or timeouts on every visit (WARNING)
 
-
-# 4xx codes that mean "the page is gone", so they are a real problem for a client homepage.
-BROKEN_PAGE_CODES = {404, 410}
-
-
-def status_means_down(status_code: int) -> bool:
-    """5xx, 404 and 410 mean down.
-
-    2xx and 3xx are fine. The other 4xx codes (401, 403, 405, 429 ...) mean the server
-    answered and is only refusing or blocking the monitor, so the site is counted as UP.
-    """
-    return status_code >= 500 or status_code in BROKEN_PAGE_CODES
+    @property
+    def ok(self) -> bool:
+        return self.signal == classify.OK
 
 
 def _decode(raw: bytes, encoding: Optional[str]) -> str:
@@ -75,99 +84,263 @@ def _decode(raw: bytes, encoding: Optional[str]) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-def check_once(site, timeout: float) -> UptimeResult:
+def check_once(site, settings) -> UptimeResult:
     """One single visit to the site. Never raises; failures come back as a result."""
-    started = time.perf_counter()
+    started_at = time.time()
+    timer = time.perf_counter()
+    headers = {**BASE_HEADERS, "User-Agent": settings.user_agent}
+    # A slow site can be given more room with "read_timeout_seconds" in SITES_JSON.
+    read_timeout = site.read_timeout_seconds or settings.read_timeout
+    failure_kind = None
+    response = None
     try:
         with requests.get(
-            site.url, headers=HEADERS, timeout=timeout, allow_redirects=True, stream=True
-        ) as response:
+            site.url,
+            headers=headers,
+            timeout=(settings.connect_timeout, read_timeout),
+            allow_redirects=True,
+            stream=True,
+        ) as reply:
             body = bytearray()
-            for chunk in response.iter_content(65536):
+            for chunk in reply.iter_content(65536):
                 body.extend(chunk)
                 if len(body) >= MAX_BODY_BYTES:
                     break
                 # Total time limit, so a server that sends one byte at a time cannot stall us.
-                if time.perf_counter() - started > timeout * 2:
+                if time.perf_counter() - timer > read_timeout * 2:
                     raise requests.exceptions.ReadTimeout()
-            elapsed = time.perf_counter() - started
-            code = response.status_code
-            result = UptimeResult(
-                ok=not status_means_down(code),
-                status_code=code,
-                response_time=elapsed,
-                final_url=response.url,
-                body=_decode(bytes(body), response.encoding),
+            response = (
+                reply.status_code,
+                reply.reason or "",
+                {name.lower(): value for name, value in reply.headers.items()},
+                _decode(bytes(body), reply.encoding),
+                reply.url,
             )
-            if not result.ok:
-                result.error_kind = "http"
-                result.error = f"Website returned HTTP {code} {response.reason or ''}".strip()
-                if code in CLOUDFLARE_CODES:
-                    result.error += " (Cloudflare could not get a good answer from the server)"
-            elif 400 <= code < 500:
-                result.note = "server answered so it counts as UP, but it may be blocking the monitor"
-            return result
-    except requests.exceptions.SSLError:
-        return UptimeResult(ok=False, error_kind="ssl", error="SSL error (certificate problem)")
-    except requests.exceptions.Timeout:
-        return UptimeResult(
-            ok=False, error_kind="timeout", error=f"Timeout (no answer within {timeout:g} seconds)"
-        )
-    except requests.exceptions.TooManyRedirects:
-        return UptimeResult(ok=False, error_kind="redirects", error="Too many redirects (redirect loop)")
-    except requests.exceptions.ConnectionError as exc:
+    except requests.exceptions.SSLError as exc:
+        # The certificate itself was rejected (expired, wrong name, untrusted) versus a
+        # handshake that broke for another reason. Only the first is a certificate warning.
         text = str(exc).lower()
-        if any(hint in text for hint in _DNS_HINTS):
-            return UptimeResult(ok=False, error_kind="dns", error="DNS lookup failed (domain not found)")
-        return UptimeResult(
-            ok=False, error_kind="connection", error="Connection failed (server refused or unreachable)"
-        )
-    except requests.exceptions.RequestException as exc:
-        return UptimeResult(ok=False, error_kind="request", error=f"Request error ({type(exc).__name__})")
+        failure_kind = "ssl_cert" if ("certificate verify failed" in text or "certificate_verify_failed" in text) else "ssl"
+    except requests.exceptions.Timeout:
+        failure_kind = "timeout"
+    except requests.exceptions.TooManyRedirects:
+        failure_kind = "redirects"
+    except requests.exceptions.ConnectionError:
+        failure_kind = "connection"
+    except requests.exceptions.RequestException:
+        failure_kind = "other"
+    elapsed = time.perf_counter() - timer
 
+    # Evidence is collected on every visit, so every alert can show DNS, TCP and TLS results.
+    probes = run_probes(site.url, settings.connect_timeout)
+    result = UptimeResult(started_at=started_at, probes=probes)
 
-def check_site(site, settings, sleep=time.sleep) -> UptimeResult:
-    """Check a site, retrying so one hiccup never causes a false DOWN alert.
+    if response is None:
+        result.signal = classify.classify_failure(failure_kind, probes)
+        result.error = _failure_text(result.signal, failure_kind, read_timeout)
+        result.finished_at = time.time()
+        return result
 
-    A site only counts as down when all attempts fail (4 attempts, 15 seconds apart).
-    A Cloudflare 520-524 error gets ONE extra retry after 30 seconds. If that retry
-    fails with a Cloudflare error too, we alert straight away.
-    """
-    result = UptimeResult(ok=False, error="Not checked")
-    cloudflare_retry_used = False
-    for attempt in range(1, settings.retry_attempts + 1):
-        result = check_once(site, settings.request_timeout)
-        result.attempts = attempt
-        if result.ok:
-            return result
-        if attempt == settings.retry_attempts:
-            break
-        if result.status_code in CLOUDFLARE_CODES:
-            if cloudflare_retry_used:
-                break
-            cloudflare_retry_used = True
-            gap = settings.cloudflare_retry_gap_seconds
-        else:
-            gap = settings.retry_gap_seconds
-        log.info("%s attempt %d failed, retrying in %gs.", settings.log_name(site), attempt, gap)
-        sleep(gap)
+    status, reason, reply_headers, text, final_url = response
+    verdict = classify.classify_response(status, reply_headers, text)
+    result.signal = verdict.signal
+    result.marker = verdict.marker
+    result.cf_code = verdict.cf_code
+    result.server = reply_headers.get("server")
+    result.status_code = status
+    result.response_time = elapsed
+    result.final_url = final_url
+    result.cf_ray = reply_headers.get("cf-ray")
+    result.cf_mitigated = reply_headers.get("cf-mitigated")
+    result.cloudflare = classify.is_cloudflare(reply_headers)
+    if result.signal == classify.OK:
+        result.body = text   # a clean page only; `text` is dropped for every other signal
+    elif result.signal == classify.CF_ORIGIN_UNKNOWN:
+        result.error = "Cloudflare error 520 (the server gave Cloudflare an empty or unexpected answer)"
+    elif result.signal == classify.CF_ORIGIN_ERROR:
+        result.error = f"Cloudflare error {status} (Cloudflare cannot get a good answer from the server)"
+    elif result.signal == classify.ORIGIN_5XX:
+        result.error = f"HTTP {status} from the server behind Cloudflare (Cloudflare passed it on)"
+    elif result.signal == classify.HTTP_ERROR:
+        result.error = f"Website returned HTTP {status} {reason}".strip()
+    result.finished_at = time.time()
     return result
 
 
-def run_uptime_checks(sites, settings) -> dict:
-    """Check every site at the same time. Returns {site_id: UptimeResult or None}.
+def _failure_text(signal: str, kind: Optional[str], read_timeout: float) -> str:
+    if signal == classify.DNS_FAIL:
+        return "DNS lookup failed (domain not found)"
+    if signal == classify.CONN_FAIL:
+        return "Connection failed (server refused or unreachable)"
+    if signal == classify.TLS_WARN:
+        return "SSL error (certificate problem)"
+    if signal == classify.TIMEOUT:
+        return f"Timeout (no answer within {read_timeout:g} seconds)"
+    if kind == "redirects":
+        return "Too many redirects (redirect loop)"
+    return "Request failed (connection problem)"
+
+
+def _attempt(site, settings, previous, sleep, clock):
+    """One attempt, waiting first if needed. Returns None if our own code failed.
+
+    First visit  a random pause (0 to stagger_seconds) so sites do not all start together.
+    Later visits at least `retry_gap_seconds` after the previous visit STARTED, and at least a
+    short rest after it ENDED. A site is only ever visited by one attempt at a time.
+    """
+    try:
+        if previous is None:
+            wait = _rng.uniform(0, settings.stagger_seconds) if settings.stagger_seconds > 0 else 0
+        else:
+            rest = min(MIN_REST_SECONDS, settings.retry_gap_seconds)
+            earliest = max(previous.started_at + settings.retry_gap_seconds, previous.finished_at + rest)
+            wait = earliest - clock()
+        if wait > 0:
+            sleep(wait)
+        return check_once(site, settings)
+    except Exception:
+        log.exception("%s internal check error", settings.log_name(site))
+        return None
+
+
+def _run_round(sites, attempts, settings, sleep, clock) -> dict:
+    """Run one attempt for each of `sites` at the same time."""
+    workers = max(1, min(len(sites), settings.max_workers))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            site.site_id: pool.submit(
+                _attempt,
+                site,
+                settings,
+                attempts[site.site_id][-1] if attempts[site.site_id] else None,
+                sleep,
+                clock,
+            )
+            for site in sites
+        }
+        return {site_id: future.result() for site_id, future in futures.items()}
+
+
+def _text_missing(site, result) -> bool:
+    return (
+        bool(site.expected_text)
+        and classify.page_is_scannable(result.signal, result.status_code)
+        and site.expected_text.lower() not in (result.body or "").lower()
+    )
+
+
+def run_uptime_checks(sites, settings, cloudflare_seen_ids=(), sleep=time.sleep, clock=time.time) -> dict:
+    """Check every site. Returns {site_id: final UptimeResult, or None if our code failed}.
 
     None means our own code failed for that site. We never turn that into a DOWN
     alert, because the website itself may be perfectly fine.
     """
+    seen = set(cloudflare_seen_ids)
+    attempts = {site.site_id: [] for site in sites}
+    broken = set()
+
+    pending = list(sites)
+    for _round in range(settings.retry_attempts):
+        if not pending:
+            break
+        outcome = _run_round(pending, attempts, settings, sleep, clock)
+        retry = []
+        for site in pending:
+            result = outcome[site.site_id]
+            if result is None:
+                broken.add(site.site_id)
+                continue
+            attempts[site.site_id].append(result)
+            if classify.needs_another_attempt(site, attempts[site.site_id], site.site_id in seen, settings.retry_attempts):
+                retry.append(site)
+        pending = retry
+
+    # A missing expected_text is only believed after one more look, a little later.
+    recheck = [
+        site
+        for site in sites
+        if site.site_id not in broken and _text_missing(site, attempts[site.site_id][-1])
+    ]
+    confirmed_missing = set()
+    if recheck:
+        wait_for = settings.text_recheck_gap_seconds
+        outcome = _run_text_recheck(recheck, attempts, settings, wait_for, sleep, clock)
+        for site in recheck:
+            second = outcome[site.site_id]
+            if second is not None and _text_missing(site, second):
+                confirmed_missing.add(site.site_id)
+
     results = {}
+    for site in sites:
+        site_attempts = attempts[site.site_id]
+        if site.site_id in broken or not site_attempts:
+            results[site.site_id] = None
+            continue
+        final = site_attempts[-1]
+        seen_before = site.site_id in seen
+        # Copies, so a result never contains itself (that would break copying and saving it).
+        final.attempt_log = [replace(a) for a in site_attempts]
+        final.attempts = len(site_attempts)
+        final.requests_made = len(site_attempts) + (1 if site in recheck else 0)
+        final.strict = classify.is_strict(site, site_attempts, seen_before)
+        final.cloudflare = any(a.cloudflare for a in site_attempts)
+        final.verdict = classify.compute_verdict(site, site_attempts, seen_before, settings.retry_attempts)
+        final.text_missing = site.site_id in confirmed_missing
+        final.config_confirmed = classify.config_error_confirmed(site_attempts, settings.retry_attempts)
+        final.origin_trouble_confirmed = classify.origin_trouble_confirmed(
+            site, site_attempts, seen_before, settings.retry_attempts
+        )
+        final.note = _no_alert_note(site, final, seen_before)
+        results[site.site_id] = final
+    return results
+
+
+def _no_alert_note(site, final, seen_before: bool) -> Optional[str]:
+    """Plain-English reason shown in the table when a site gets no alert and is not clean UP."""
+    signal = final.signal
+    if final.verdict == classify.VERDICT_DOWN or signal in (classify.OK, *classify.INSPECTION_BLOCKED_SIGNALS):
+        return None
+    cloudflare_site = site.behind_cloudflare or seen_before or final.cloudflare
+    if final.origin_trouble_confirmed:
+        return f"trouble on every one of {final.attempts} visits, warning email sent (not DOWN)"
+    if signal == classify.HTTP_ERROR:
+        return f"HTTP {final.status_code}, the server answered but gave no usable page, so no alert (as before) and no content scan"
+    if signal == classify.TLS_WARN:
+        return "no response, certificate invalid, " + (
+            "no alert because Cloudflare site" if cloudflare_site else "warning email sent"
+        )
+    if signal == classify.CF_CONFIG_ERROR:
+        if final.config_confirmed:
+            return f"Cloudflare error {final.cf_code} confirmed on all visits, warning email sent"
+        return f"Cloudflare error {final.cf_code} seen but not on every visit, no alert"
+    if signal in classify.ORIGIN_TROUBLE_SIGNALS:
+        return f"{signal} seen but not on every visit, no alert"
+    if signal == classify.OTHER_FAIL:
+        return "no response (connection problem), no alert on Cloudflare or externally monitored sites"
+    return None
+
+
+def _run_text_recheck(sites, attempts, settings, wait_for, sleep, clock) -> dict:
+    """One extra visit for sites whose expected_text looked missing."""
+
+    def recheck(site):
+        try:
+            previous = attempts[site.site_id][-1].started_at
+            wait = previous + wait_for - clock()
+            if wait > 0:
+                sleep(wait)
+            return check_once(site, settings)
+        except Exception:
+            log.exception("%s internal check error", settings.log_name(site))
+            return None
+
     workers = max(1, min(len(sites), settings.max_workers))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {site.site_id: pool.submit(check_site, site, settings) for site in sites}
-        for site in sites:
-            try:
-                results[site.site_id] = futures[site.site_id].result()
-            except Exception:
-                log.exception("%s internal check error", settings.log_name(site))
-                results[site.site_id] = None
-    return results
+        futures = {site.site_id: pool.submit(recheck, site) for site in sites}
+        return {site_id: future.result() for site_id, future in futures.items()}
+
+
+def check_site(site, settings, sleep=time.sleep, clock=time.time, cloudflare_seen=False):
+    """Check a single site (handy for tests and quick experiments)."""
+    seen = {site.site_id} if cloudflare_seen else set()
+    return run_uptime_checks([site], settings, seen, sleep, clock)[site.site_id]

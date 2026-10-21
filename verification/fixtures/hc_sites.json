@@ -1,0 +1,4 @@
+[
+ {"name": "Limo OK", "url": "http://localhost:8083/ok"},
+ {"name": "Limo Broken", "url": "http://localhost:8083/plain-500"}
+]

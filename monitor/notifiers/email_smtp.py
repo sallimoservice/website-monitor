@@ -13,6 +13,7 @@ import time
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 
+from .. import dryrun
 from ..alerts import EMOJI, Alert, group_summary, top_kind
 from ..timeutil import fmt_time
 
@@ -118,6 +119,7 @@ class EmailNotifier:
 
     def send(self, alerts) -> bool:
         """Send all alerts as ONE email. Returns True if the server accepted it."""
+        dryrun.forbid("send an email")
         s = self.settings
         msg = build_message(s, alerts)
         envelope_from = parseaddr(s.smtp_from)[1] or s.smtp_user

@@ -3,11 +3,15 @@
     "name": "Example Client One",
     "url": "https://client-one.example.com",
     "expected_domain": "client-one.example.com",
-    "slow_threshold_seconds": 6
+    "slow_threshold_seconds": 6,
+    "read_timeout_seconds": 45
   },
   {
-    "name": "Example Client Two",
+    "name": "Example Client Two (behind Cloudflare, uptime watched by an external monitor)",
     "url": "https://client-two.example.org/",
+    "behind_cloudflare": true,
+    "uptime_source": "external",
+    "expected_text": "Book a ride",
     "connection_refused_is_warning": false,
     "keywords_to_watch": ["hacked by", "casino"]
   },
