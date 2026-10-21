@@ -18,7 +18,7 @@ Rules
 - Trouble behind Cloudflare (a mix of 5xx answers passed through from the server, Cloudflare 52x
   errors and timeouts) is never DOWN unless all 3 visits are the same Cloudflare 52x error, but 3
   visits in a row give a WARNING. It repeats every 8 hours while it lasts. Sites that hand their
-  uptime to an external monitor stay silent for it.
+  uptime to an external monitor get it too: the external monitor owns DOWN, not visibility.
 
 Labels are separate from alerts. A site only gets the label UP when the monitor received a clean
 normal page. A 403 or 503 answer, a missing response or a challenge page never earns UP, even

@@ -5,6 +5,7 @@ import http.server
 import os
 import tempfile
 import threading
+import time
 
 from monitor.config import Site, load_settings, make_site_id
 
@@ -26,6 +27,9 @@ class FakeSites:
             def do_GET(self):
                 outer.hits[self.path] = outer.hits.get(self.path, 0) + 1
                 status, headers, body = outer.routes.get(self.path, (404, {}, b"missing"))
+                if status == "hang":   # never answers within a test's read timeout
+                    time.sleep(3)
+                    status = 200
                 self.send_response(status)
                 for key, value in headers.items():
                     self.send_header(key, value)

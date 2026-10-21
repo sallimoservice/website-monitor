@@ -55,8 +55,8 @@ STRICT_DOWN_SIGNALS = frozenset({DNS_FAIL, CONN_FAIL, CF_ORIGIN_ERROR})
 # inside the real site, and we say nothing about it.
 INSPECTION_BLOCKED_SIGNALS = frozenset({CHALLENGE, CF_VISITOR_BLOCK})
 # Signals that all mean "the server behind Cloudflare is in trouble". On a Cloudflare site that is
-# not covered by an external monitor, three visits in a row from this family give a WARNING (all
-# CF_ORIGIN_ERROR is still a DOWN). A mix such as 522, then 504, then a timeout is still trouble.
+# (including one an external monitor watches), three visits in a row from this family give a WARNING (all
+# CF_ORIGIN_ERROR is still a DOWN). A plain 5xx without Cloudflare headers counts too (is_origin_trouble). A mix such as 522, then 504, then a timeout is still trouble.
 ORIGIN_TROUBLE_SIGNALS = frozenset({CF_ORIGIN_ERROR, CF_ORIGIN_UNKNOWN, ORIGIN_5XX, TIMEOUT})
 # Only a clean normal page may be used for content checks or saved as a baseline.
 SCANNABLE_SIGNALS = frozenset({OK})
@@ -262,18 +262,27 @@ def down_eligible(signal: str, status_code: Optional[int], strict: bool) -> bool
 
 
 def warns_on_origin_trouble(site, attempts, cloudflare_seen: bool) -> bool:
-    """Cloudflare sites that do not hand their uptime to an external monitor get the warning."""
-    return is_strict(site, attempts, cloudflare_seen) and site.uptime_source != "external"
+    """Every strict site gets the warning, including sites an external monitor watches.
+
+    The external monitor can own the DOWN decision. It does not own this monitor's visibility.
+    """
+    return is_strict(site, attempts, cloudflare_seen)
+
+
+def is_origin_trouble(attempt) -> bool:
+    """One visit that counts as trouble from the server: a 5xx (with or without Cloudflare headers) or a timeout."""
+    if attempt.signal in ORIGIN_TROUBLE_SIGNALS:
+        return True
+    return attempt.signal == HTTP_ERROR and attempt.status_code is not None and attempt.status_code >= 500
 
 
 def origin_trouble_confirmed(site, attempts, cloudflare_seen: bool, needed: int) -> bool:
     """3 visits in a row from ORIGIN_TROUBLE_SIGNALS, not all CF_ORIGIN_ERROR (that is a DOWN)."""
     if len(attempts) < needed or not warns_on_origin_trouble(site, attempts, cloudflare_seen):
         return False
-    signals = [a.signal for a in attempts]
-    if not all(s in ORIGIN_TROUBLE_SIGNALS for s in signals):
+    if not all(is_origin_trouble(a) for a in attempts):
         return False
-    return not all(s == CF_ORIGIN_ERROR for s in signals)
+    return not all(a.signal == CF_ORIGIN_ERROR for a in attempts)
 
 
 def needs_another_attempt(site, attempts, cloudflare_seen: bool, needed: int) -> bool:
@@ -282,7 +291,7 @@ def needs_another_attempt(site, attempts, cloudflare_seen: bool, needed: int) ->
         return False
     if all(a.signal == CF_CONFIG_ERROR for a in attempts):
         return True   # a site-side Cloudflare error is confirmed by seeing it 3 times in a row
-    if warns_on_origin_trouble(site, attempts, cloudflare_seen) and all(a.signal in ORIGIN_TROUBLE_SIGNALS for a in attempts):
+    if warns_on_origin_trouble(site, attempts, cloudflare_seen) and all(is_origin_trouble(a) for a in attempts):
         return True   # trouble behind Cloudflare is confirmed the same way
     strict = is_strict(site, attempts, cloudflare_seen)
     if not all(down_eligible(a.signal, a.status_code, strict) for a in attempts):

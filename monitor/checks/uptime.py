@@ -301,6 +301,8 @@ def _no_alert_note(site, final, seen_before: bool) -> Optional[str]:
     if final.verdict == classify.VERDICT_DOWN or signal in (classify.OK, *classify.INSPECTION_BLOCKED_SIGNALS):
         return None
     cloudflare_site = site.behind_cloudflare or seen_before or final.cloudflare
+    if final.origin_trouble_confirmed:
+        return f"trouble on every one of {final.attempts} visits, warning email sent (not DOWN)"
     if signal == classify.HTTP_ERROR:
         return f"HTTP {final.status_code}, the server answered but gave no usable page, so no alert (as before) and no content scan"
     if signal == classify.TLS_WARN:
@@ -312,10 +314,6 @@ def _no_alert_note(site, final, seen_before: bool) -> Optional[str]:
             return f"Cloudflare error {final.cf_code} confirmed on all visits, warning email sent"
         return f"Cloudflare error {final.cf_code} seen but not on every visit, no alert"
     if signal in classify.ORIGIN_TROUBLE_SIGNALS:
-        if final.origin_trouble_confirmed:
-            return f"trouble on every one of {final.attempts} visits, warning email sent (not DOWN)"
-        if final.strict and site.uptime_source == "external":
-            return f"{signal}, no alert: the external monitor owns uptime for this site"
         return f"{signal} seen but not on every visit, no alert"
     if signal == classify.OTHER_FAIL:
         return "no response (connection problem), no alert on Cloudflare or externally monitored sites"
