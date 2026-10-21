@@ -1,0 +1,6 @@
+[
+ {"name": "Shared A", "url": "http://localhost:8083/ok?x=1"},
+ {"name": "Shared B", "url": "http://localhost:8083/ok?x=2"},
+ {"name": "Shared C", "url": "http://localhost:8083/ok?x=3"},
+ {"name": "Via CF", "url": "http://localhost:8083/cf-ok"}
+]

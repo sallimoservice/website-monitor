@@ -47,9 +47,13 @@ it can be judged on its own later.
    bot commit counts as repository activity. The Healthchecks alarm is the independent backstop.
 8. **Maintenance windows.** A per-site "quiet until" date so planned work does not send reminders
    every 8 hours.
-9. **Move the verification scripts into the repository.** The scripts behind the earlier "314 checks"
-   (stage_a, round2 to round6, migrate and regression runs) live in a session scratch folder, not in the
-   repo, and need their fake Cloudflare and SMTP servers. Only `tests/` is in the repo.
+9. **Verification scripts. DONE on 21 Oct 2026**, kept here as a reminder of what they need. They live in
+   `verification/` and run with `python verification/run_all.py`. They need the `openssl` command, git
+   history (the Stage 1 comparison rebuilds commit 6a5c558) and permission to listen on localhost port 465
+   (root on Linux, because the monitor only uses SSL mail on exactly port 465). A suite that cannot run says
+   SKIPPED, and a skip is never counted as a pass. Two documented known gaps are asserted as they are today
+   (damaged state with wrong types, and the wording after a gap), so fixing items 2 and 3 above will make
+   those rows fail on purpose and the expectation must then be updated.
 10. **Smaller ones.** A second opinion from an external checker for "connection refused" (the SRTC Limo
     case), a cap on reminder emails for very long outages, SETTINGS HELP wording for `behind_cloudflare` (it only matters before a Cloudflare
     response has been seen, and it hides certificate warnings), daily summary lines for DNS degraded,

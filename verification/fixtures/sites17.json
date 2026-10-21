@@ -1,0 +1,71 @@
+[
+ {
+  "name": "Limo 01",
+  "url": "http://localhost:8083/dyn?s=01"
+ },
+ {
+  "name": "Limo 02",
+  "url": "http://localhost:8083/dyn?s=02"
+ },
+ {
+  "name": "Limo 03",
+  "url": "http://localhost:8083/dyn?s=03",
+  "slow_threshold_seconds": 1.0
+ },
+ {
+  "name": "Limo 04",
+  "url": "http://localhost:8083/dyn?s=04"
+ },
+ {
+  "name": "Limo 05",
+  "url": "http://localhost:8083/dyn?s=05"
+ },
+ {
+  "name": "Limo 06",
+  "url": "http://localhost:8083/dyn?s=06"
+ },
+ {
+  "name": "Limo 07",
+  "url": "http://localhost:8083/dyn?s=07"
+ },
+ {
+  "name": "Limo 08",
+  "url": "http://localhost:8083/dyn?s=08"
+ },
+ {
+  "name": "Limo 09",
+  "url": "http://localhost:8083/dyn?s=09"
+ },
+ {
+  "name": "Limo 10",
+  "url": "http://localhost:8083/dyn?s=10"
+ },
+ {
+  "name": "Limo 11",
+  "url": "http://localhost:8083/dyn?s=11"
+ },
+ {
+  "name": "Limo 12",
+  "url": "http://localhost:8083/dyn?s=12"
+ },
+ {
+  "name": "Limo 13",
+  "url": "http://localhost:8083/dyn?s=13"
+ },
+ {
+  "name": "Limo 14",
+  "url": "http://localhost:8083/dyn?s=14"
+ },
+ {
+  "name": "Limo 15",
+  "url": "http://localhost:8083/dyn?s=15"
+ },
+ {
+  "name": "Limo 16",
+  "url": "http://localhost:8083/dyn?s=16"
+ },
+ {
+  "name": "Limo 17",
+  "url": "http://gone-example.invalid/"
+ }
+]
