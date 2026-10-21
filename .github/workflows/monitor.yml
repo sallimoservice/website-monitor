@@ -29,9 +29,11 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    # A run takes up to about 4 minutes when sites are failing (3 visits, 60 seconds apart),
-    # and well under a minute when all is well. 10 minutes is a safety limit so a stuck run can never burn Actions minutes.
-    timeout-minutes: 10
+    # A run takes about 4 minutes when sites are failing (3 visits, 60 seconds apart) and up to about
+    # 6.5 minutes in the worst case (servers that answer very slowly), plus about a minute of setup.
+    # It takes well under a minute when all is well. 15 minutes leaves room, and still stops a stuck run.
+    # A run killed by this limit is a silent run, so the limit must never be close to the worst case.
+    timeout-minutes: 15
     steps:
       - name: Check out code
         uses: actions/checkout@v4

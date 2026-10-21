@@ -72,3 +72,13 @@ class CacheTests(unittest.TestCase):
         restore = _step("Restore saved state")
         self.assertIn("actions/cache/restore", restore)
         self.assertNotIn("inputs.dry_run", restore)
+
+
+class TimeoutTests(unittest.TestCase):
+    # Worst case measured and reasoned in the audit: about 6.5 minutes of checks plus about 1 minute of setup.
+    WORST_CASE_MINUTES = 7.5
+
+    def test_job_timeout_leaves_room_over_the_worst_case(self):
+        minutes = int(re.search(r"(?m)^    timeout-minutes:\s*(\d+)", _text()).group(1))
+        self.assertGreaterEqual(minutes, 15)
+        self.assertGreaterEqual(minutes, 2 * self.WORST_CASE_MINUTES, "a run killed by the limit is a silent run")
