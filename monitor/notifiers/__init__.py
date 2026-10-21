@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+from .. import dryrun
 from .email_smtp import EmailNotifier
 
 log = logging.getLogger("monitor.notify")
@@ -26,6 +27,7 @@ def build_notifiers(settings) -> list:
 
 def dispatch(alerts, notifiers) -> DispatchResult:
     """Send alerts through every channel. An alert counts as delivered if ANY channel took it."""
+    dryrun.forbid("send an alert")
     result = DispatchResult(delivered=[False] * len(alerts))
     for notifier in notifiers:
         indexes = [i for i, alert in enumerate(alerts) if notifier.accepts(alert)]

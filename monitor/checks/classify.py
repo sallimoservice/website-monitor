@@ -99,13 +99,12 @@ CF_CONFIG_ERRORS = {
 # summary can mention it (see is_recognised_cf_code).
 CF_VISITOR_BLOCK_CODES = frozenset({1003, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1015, 1020, 1106})
 
-# Text that only a real challenge page contains.
-CHALLENGE_TEXT_MARKERS = (
-    "just a moment",
-    "attention required",
-    "cf-chl",
-    "checking your browser",
-)
+# Words that only a real challenge page carries. A plain server error page (a maintenance
+# notice that says "back in just a moment", an "Attention required" banner) can contain the same
+# words in its body, so the generic phrases only count when they are the page TITLE, which is how
+# Cloudflare's own pages are built. "cf-chl" appears only in Cloudflare's challenge code.
+CHALLENGE_TITLE_STARTS = ("just a moment", "attention required")
+CHALLENGE_TEXT_MARKERS = ("cf-chl",)
 # Cloudflare also puts a harmless script under /cdn-cgi/challenge-platform/ into ORDINARY pages,
 # including errors passed through from the server. So that word alone proves nothing. Only a
 # real challenge page also loads its "orchestrate" / "chl_page" scripts.
@@ -149,27 +148,35 @@ def find_cf_error_code(status: int, headers: dict, body: str) -> Optional[int]:
     return None
 
 
+def _page_title(body: str) -> str:
+    title = _TITLE_RE.search((body or "")[:20_000])
+    return title.group(1).strip().lower() if title else ""
+
+
 def find_challenge(status: int, headers: dict, body: str) -> Optional[str]:
     """Detect a Cloudflare challenge. Returns the name of the marker that matched.
 
-    Proof is one of: the cf-mitigated header, a challenge marker in the page of an error
-    answer, or on a 200 the exact "Just a moment..." title. A cf-ray header with a status code
-    is deliberately NOT proof (see the module notes), or an overloaded server's 503 would be
-    mistaken for a challenge and go unreported.
+    Proof is one of: the cf-mitigated header; on an error answer, a challenge page title or
+    Cloudflare's own challenge code; on a 200, the exact "Just a moment..." title. A cf-ray header
+    with a status code is deliberately NOT proof, and neither is a phrase in the body text, or an
+    overloaded server's 503 would be mistaken for a challenge and go unreported.
     """
     if "cf-mitigated" in headers:
         return "header cf-mitigated"
-    if status != 200:
-        lowered = (body or "")[:_SCAN_LIMIT].lower()
-        for marker in CHALLENGE_TEXT_MARKERS:
-            if marker in lowered:
-                return f"text '{marker}'"
-        if "challenge-platform" in lowered and any(word in lowered for word in _CHALLENGE_PLATFORM_PROOF):
-            return "text 'challenge-platform' (challenge page)"
-        return None
-    title = _TITLE_RE.search((body or "")[:20_000])
-    if title and title.group(1).strip().lower().startswith("just a moment"):
-        return "title 'just a moment'"
+    title = _page_title(body)
+    if status == 200:
+        return "title 'just a moment'" if title.startswith("just a moment") else None
+    for start in CHALLENGE_TITLE_STARTS:
+        if title.startswith(start):
+            return f"title '{start}'"
+    lowered = (body or "")[:_SCAN_LIMIT].lower()
+    for marker in CHALLENGE_TEXT_MARKERS:
+        if marker in lowered:
+            return f"text '{marker}'"
+    if "checking your browser" in lowered and "cloudflare" in lowered:
+        return "text 'checking your browser' (Cloudflare page)"
+    if "challenge-platform" in lowered and any(word in lowered for word in _CHALLENGE_PLATFORM_PROOF):
+        return "text 'challenge-platform' (challenge page)"
     return None
 
 

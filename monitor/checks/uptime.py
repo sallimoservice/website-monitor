@@ -64,6 +64,7 @@ class UptimeResult:
     probes: Optional[Probes] = None
     # Filled in on the final result of a site:
     attempts: int = 1
+    requests_made: int = 1                  # page visits for this site this run, including the text re-check
     attempt_log: list = field(default_factory=list, repr=False)
     verdict: str = classify.VERDICT_NOT_DOWN
     strict: bool = False
@@ -278,6 +279,7 @@ def run_uptime_checks(sites, settings, cloudflare_seen_ids=(), sleep=time.sleep,
         # Copies, so a result never contains itself (that would break copying and saving it).
         final.attempt_log = [replace(a) for a in site_attempts]
         final.attempts = len(site_attempts)
+        final.requests_made = len(site_attempts) + (1 if site in recheck else 0)
         final.strict = classify.is_strict(site, site_attempts, seen_before)
         final.cloudflare = any(a.cloudflare for a in site_attempts)
         final.verdict = classify.compute_verdict(site, site_attempts, seen_before, settings.retry_attempts)

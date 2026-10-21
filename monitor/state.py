@@ -15,6 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import dryrun
 from .checks.classify import SCANNABLE_SIGNALS
 
 log = logging.getLogger("monitor.state")
@@ -45,6 +46,7 @@ DEFAULT_SITE_STATE = {
     "down_notified_at": None,   # when we last delivered a DOWN alert or reminder
     "pending_recovery": None,   # a RECOVERED alert that has not been delivered yet
     "slow_active": False,       # True while the site is slower than its limit
+    "slow_alert_pending": False,  # a slow warning was raised but not delivered yet (retried next run)
     "last_slow_alert": None,    # when we last delivered a slow warning
     "refused_active": False,    # True while a "connection refused" warning is in effect
     "last_refused_alert": None, # when we last delivered a connection-refused warning
@@ -77,6 +79,7 @@ def load_state(path: str) -> dict:
 
 def save_state(path: str, state: dict) -> None:
     """Write state.json safely: write a temp file first, then swap it in."""
+    dryrun.forbid("write the state file")
     state["version"] = STATE_VERSION
     state = {key: value for key, value in state.items() if key != "_fresh"}
     target = Path(path)

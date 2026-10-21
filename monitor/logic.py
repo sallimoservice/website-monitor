@@ -202,14 +202,16 @@ def _slow_alerts(site, site_state, result, now, settings) -> list:
     slow = result.response_time is not None and result.response_time > site.slow_threshold_seconds
     if not slow:
         site_state["slow_active"] = False
+        site_state["slow_alert_pending"] = False
         return []
     already_slow = site_state["slow_active"]
     site_state["slow_active"] = True
-    if already_slow:
+    if already_slow and not site_state["slow_alert_pending"]:
         return []  # one warning per slow period, not one every run
     last = site_state["last_slow_alert"]
     if last is not None and now - last < SLOW_WARNING_COOLDOWN_SECONDS:
         return []
+    site_state["slow_alert_pending"] = True   # cleared only when the email is really delivered
     return [
         Alert(
             kind=WARNING,
@@ -433,6 +435,7 @@ def apply_delivery(state: dict, alert: Alert, now: float) -> None:
         site_state["pending_recovery"] = None
     elif alert.tag == "slow":
         site_state["last_slow_alert"] = now
+        site_state["slow_alert_pending"] = False
     elif alert.tag == "refused":
         site_state["last_refused_alert"] = now
     elif alert.tag == "tls":

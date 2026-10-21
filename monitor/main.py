@@ -18,7 +18,7 @@ import sys
 import time
 from collections import Counter
 
-from . import heartbeat
+from . import dryrun, heartbeat
 from . import state as state_store
 from .alerts import CRASH, TEST, WARNING, Alert
 from .checks import classify
@@ -105,6 +105,7 @@ def run_test_alert(settings) -> int:
 # --notify-crash
 # --------------------------------------------------------------------------------------
 def run_notify_crash(settings) -> int:
+    heartbeat.ping(settings.healthcheck_url, failed=True)   # Healthchecks hears about it even if email is down
     notifiers = build_notifiers(settings)
     if not notifiers:
         log.error("Monitor crashed, but no notification channel is configured.")
@@ -140,16 +141,30 @@ def run_notify_crash(settings) -> int:
 # normal run and --dry-run
 # --------------------------------------------------------------------------------------
 def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -> int:
+    try:
+        return _run_checks(settings, sites, dry_run, skipped, keep_ids)
+    finally:
+        dryrun.disarm()
+
+
+def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -> int:
     from .checks.uptime import run_uptime_checks  # imported here so --notify-crash needs no packages
 
     started = time.time()
+    if dry_run:
+        dryrun.arm()   # from here on, sending, pinging and saving all raise an error
     state = state_store.load_state(settings.state_path)
+    state_info = _state_info(state, sites)
     # Sites skipped for a config typo keep their saved state, so a typo cannot wipe a baseline.
     removed = state_store.prune_removed_sites(state, [s.site_id for s in sites] + list(keep_ids))
     if removed:
         log.info("Forgot the saved state of %d removed website(s).", removed)
-    if state.get("_fresh"):
-        log.info("Saved state was missing, so everything is learned from scratch (no change alerts this run).")
+    rebuilt = bool(state.get("_fresh"))
+    if rebuilt:
+        log.warning(
+            "STATE WAS MISSING and has been rebuilt from scratch (first run, or the cache expired). "
+            "No alerts are sent this run; every site is treated as a first visit."
+        )
     cloudflare_seen = {
         site.site_id for site in sites if state_store.get_site_state(state, site.site_id)["cloudflare_seen"]
     }
@@ -158,6 +173,7 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
     results = run_uptime_checks(sites, settings, cloudflare_seen)
 
     alerts, rows, advice, hosting, internal_errors = [], [], [], [], 0
+    reasons, alert_lines, total_requests = [], [], 0   # extra dry-run report material
     counts = Counter()
     paused, resumed, auto_detected = [], [], []
     dns_lookup_failures = 0
@@ -169,7 +185,11 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
             continue
         site_state = state_store.get_site_state(state, site.site_id)
         was_blocked = site_state["inspection_blocked"]
-        alerts.extend(evaluate_uptime(site, site_state, result, started, settings))
+        new_alerts = evaluate_uptime(site, site_state, result, started, settings)
+        alerts.extend(new_alerts)
+        total_requests += result.requests_made
+        reasons.append((settings.log_name(site), site_state["last_state"], _reason(site, result, site_state)))
+        alert_lines.extend(_alert_line(settings, site, alert, result) for alert in new_alerts)
 
         counts[site_state["last_state"]] += 1
         if result.verdict == classify.VERDICT_MIXED:
@@ -209,35 +229,56 @@ def run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) ->
         "dns_lookup_failures": dns_lookup_failures,
         "dns_degraded": dns_lookup_failures > DNS_DEGRADED_THRESHOLD,
         "unrecognised_cf_codes": dict(unrecognised_codes),
+        "state_rebuilt": rebuilt,
+        "alerts_withheld": len(alerts) if rebuilt else 0,
     }
     _log_aggregate(stats)
 
     if dry_run:
-        _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats)
+        extra = {"state_info": state_info, "reasons": reasons, "alert_lines": alert_lines,
+                 "requests": total_requests, "runtime": time.time() - started, "rebuilt": rebuilt}
+        _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats, extra)
         return 1 if internal_errors else 0
 
-    if alerts:
+    send_failed = False
+    if rebuilt:
+        if alerts:
+            log.warning("%d alert(s) were held back because the state was rebuilt. Anything real is "
+                        "raised again on the next run.", len(alerts))
         notifiers = build_notifiers(settings)
-        if not notifiers:
-            log.warning("%d alert(s) could not be sent because no channel is configured.", len(alerts))
-        else:
-            outcome = dispatch(alerts, notifiers)
-            now = time.time()
-            for alert, delivered in zip(alerts, outcome.delivered):
-                if delivered:
-                    apply_delivery(state, alert, now)
-                else:
-                    log.warning("An alert was not delivered and will be retried on the next run.")
+        alerts_to_send = []
+    else:
+        notifiers = build_notifiers(settings)
+        alerts_to_send = alerts
+    if not notifiers:
+        # A monitor that cannot reach you is broken, so this is a failed run even with nothing to send.
+        send_failed = True
+        log.error("No notification channel is configured, so this monitor cannot reach you.")
+    elif alerts_to_send:
+        outcome = dispatch(alerts_to_send, notifiers)
+        now = time.time()
+        for alert, delivered in zip(alerts_to_send, outcome.delivered):
+            if delivered:
+                apply_delivery(state, alert, now)
+            else:
+                send_failed = True
+        if send_failed:
+            log.error("%d of %d alert(s) could not be delivered. They stay pending and are retried on the next run.",
+                      outcome.delivered.count(False), len(alerts_to_send))
 
     state["meta"]["last_run"] = started
+    if rebuilt:
+        state["meta"]["state_rebuilt_at"] = started
     state["meta"]["last_run_stats"] = stats      # read by the daily summary
     state_store.save_state(settings.state_path, state)
     log.info("Done in %.1fs.", time.time() - started)
 
     if internal_errors:
         log.error("%d website(s) could not be checked because of an internal error.", internal_errors)
+    if internal_errors or send_failed:
+        heartbeat.ping(settings.healthcheck_url, failed=True)
         return 1
-    heartbeat.ping(settings.healthcheck_url)
+    heartbeat.ping(settings.healthcheck_url)   # only here: every site checked and every alert delivered
     return 0
 
 
@@ -284,7 +325,68 @@ def _short_result(result) -> str:
     return f"{result.signal} HTTP {code} {ms}" + (" (mixed signals)" if result.verdict == classify.VERDICT_MIXED else "")
 
 
-TABLE_HEADERS = ["SITE", "STATE", "HTTP", "SIGNAL", "DNS(1.1.1.1 / 8.8.8.8)", "TCP443", "TLS", "MS", "ATTEMPT TIMES (UTC)", "NOTE"]
+TABLE_HEADERS = ["SITE", "STATE", "HTTP", "SIGNAL", "DNS(1.1.1.1 / 8.8.8.8)", "TCP443", "TLS", "MS", "REQS",
+                 "ATTEMPT TIMES (UTC)", "NOTE"]
+
+
+def _state_info(state, sites) -> dict:
+    """What the saved state file held when the run started (read before anything touches it)."""
+    saved = state.get("sites", {})
+    ids = {site.site_id for site in sites}
+    now = time.time()
+    rows = [row for site_id in ids for row in (saved.get(site_id) or {}).get("history", [])]
+    return {
+        "fresh": bool(state.get("_fresh")),
+        "version": state.get("version"),
+        "saved_sites": len(saved),
+        "matched": sum(1 for site_id in ids if site_id in saved),
+        "configured": len(ids),
+        "with_history": sum(1 for site_id in ids if (saved.get(site_id) or {}).get("history")),
+        "history_rows": len(rows),
+        "oldest_hours": (now - min(row[0] for row in rows)) / 3600 if rows else None,
+        "last_run_hours": (now - state["meta"]["last_run"]) / 3600 if state.get("meta", {}).get("last_run") else None,
+    }
+
+
+def _reason(site, result, site_state) -> str:
+    """One plain sentence for why a site landed in its bucket. Never contains a URL or client name."""
+    attempts = result.attempt_log or [result]
+    visits = f"{len(attempts)} visit{'s' if len(attempts) != 1 else ''}"
+    code = result.status_code or "no answer"
+    ms = f"{result.response_time * 1000:.0f}ms" if result.response_time is not None else "no timing"
+    state_name = site_state["last_state"]
+    if state_name == "DOWN":
+        return f"{result.signal} on every one of {visits} (HTTP {code}), confirmed down"
+    if state_name == "SLOW":
+        return f"clean page but {ms} is over its {site.slow_threshold_seconds:g}s limit"
+    if state_name == "UP":
+        return f"clean page, HTTP {code}, {ms}"
+    if state_name == "WARNING":
+        return result.note or f"{result.signal} (HTTP {code}) over {visits}, warning raised"
+    detail = result.note or f"{result.signal} (HTTP {code})"
+    if result.marker:
+        detail += f", matched {result.marker}"
+    return detail
+
+
+_ALERT_REASONS = {
+    "down": "confirmed DOWN",
+    "recovered": "back up after an outage",
+    "slow": "slower than its limit",
+    "refused": "connection refused (warning)",
+    "tls": "certificate problem (warning)",
+    "text": "expected text missing (warning)",
+    "cfconfig": "Cloudflare configuration error (warning)",
+    "origin": "server behind Cloudflare is failing (warning)",
+}
+
+
+def _alert_line(settings, site, alert, result) -> str:
+    why = _ALERT_REASONS.get(alert.tag, alert.tag or "alert")
+    line = f"{alert.emoji} {settings.log_name(site)}: {alert.label}, {why}, signal {result.signal}, HTTP {result.status_code or '-'}"
+    if settings.real_names_in_logs:
+        line += f" ({alert.summary})"
+    return line
 
 
 def _table_row(settings, site, result, site_state) -> list:
@@ -316,6 +418,7 @@ def _table_row(settings, site, result, site_state) -> list:
         probes.tcp if probes else "-",
         probes.tls if probes else "-",
         "/".join(f"{a.response_time * 1000:.0f}" if a.response_time is not None else "-" for a in attempts),
+        str(result.requests_made),
         "/".join(time.strftime("%H:%M:%S", time.gmtime(a.started_at)) for a in attempts),
         "; ".join(notes) or "-",
     ]
@@ -451,9 +554,30 @@ def _print_hosting(settings, entries) -> None:
         print(f"  No address found: {', '.join(no_address)}")
 
 
-def _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats) -> None:
+def _print_state_check(info) -> None:
+    print("STATE CHECK (what was in the saved state when this run started)")
+    if info["fresh"]:
+        print("  NO SAVED STATE FOUND. A real run would start from scratch: no alerts that run, history empty.")
+        return
+    age = f", last run {info['last_run_hours']:.1f} hours ago" if info["last_run_hours"] is not None else ""
+    print(f"  Loaded a saved state file (format version {info['version'] or 1}){age}.")
+    print(f"  {info['matched']} of {info['configured']} configured sites have saved state "
+          f"({info['configured'] - info['matched']} new), {info['saved_sites'] - info['matched']} saved entries belong to removed sites.")
+    oldest = f", oldest {info['oldest_hours']:.1f} hours old" if info["oldest_hours"] is not None else ""
+    print(f"  History kept: {info['history_rows']} check results across {info['with_history']} sites{oldest}. "
+          "Nothing was written back.")
+
+
+def _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats, extra) -> None:
+    print()
+    _print_state_check(extra["state_info"])
     print()
     _print_table(TABLE_HEADERS, rows)
+    print("  MS and ATTEMPT TIMES list each visit in order. REQS = page visits this run for that site.")
+    print()
+    print("CLASSIFICATION (every site, its bucket and the reason)")
+    for label, bucket, reason in extra["reasons"]:
+        print(f"  {label}  {bucket:<18} {reason}")
     print()
     print("SETTINGS HELP (suggestions only, nothing is changed for you)")
     _print_table(ADVICE_HEADERS, advice)
@@ -469,15 +593,21 @@ def _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats
     if stats["skipped_config"]:
         print(f"{stats['skipped_config']} entr{'y' if stats['skipped_config'] == 1 else 'ies'} in SITES_JSON "
               "skipped because of config problems (see the warnings above).")
+    print("WOULD ALERT ON A REAL RUN")
     if not alerts:
-        print("No alerts would be sent.")
-        return
-    print(f"{len(alerts)} alert(s) would be sent:")
-    for alert in alerts:
-        if settings.real_names_in_logs:
-            print(f"  {alert.emoji} {alert.label}: {alert.site_name} - {alert.summary}")
-        else:
-            print(f"  {alert.emoji} {alert.label} (details hidden in public logs)")
+        print("  Nothing. No alerts would be sent.")
+    else:
+        for line in extra["alert_lines"]:
+            print(f"  {line}")
+        if extra["rebuilt"]:
+            print("  (State is missing, so a real run would HOLD BACK all of these and raise them on the next run.)")
+        elif not settings.real_names_in_logs:
+            print("  (Details are hidden in public logs. The email carries the full evidence.)")
+    print()
+    print("RUN SUMMARY")
+    print(f"  {stats['sites']} sites, {extra['requests']} page visits in total, "
+          f"{extra['runtime']:.0f}s total runtime ({extra['runtime'] / 60:.1f} min).")
+    print("  Emails sent 0, Healthchecks pings 0, state writes 0 (the dry-run lock stays armed and would stop any attempt).")
 
 
 def main(argv=None) -> int:
