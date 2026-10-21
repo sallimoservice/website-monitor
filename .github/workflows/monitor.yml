@@ -112,7 +112,9 @@ jobs:
           key: monitor-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Cache entries cannot be overwritten, so each run adds one. Keep only the newest 3.
-      # Dry runs and test alerts only READ the saved state. They never save and never delete.
+      # Only caches of THIS branch are listed (--ref), so a run can never delete the saved state of
+      # another branch, such as main's. Dry runs and test alerts only READ the saved state. They
+      # never save and never delete.
       - name: Delete old state caches
         if: always() && inputs.dry_run != true && inputs.test_alert != true
         continue-on-error: true
@@ -120,5 +122,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh cache list --key monitor-state- --sort created_at --order desc --limit 100 --json id --jq '.[3:][].id' \
+          gh cache list --key monitor-state- --ref "$GITHUB_REF" --sort created_at --order desc --limit 100 --json id --jq '.[3:][].id' \
             | xargs -r -n1 gh cache delete

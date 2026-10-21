@@ -33,3 +33,42 @@ class ScheduleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CacheTests(unittest.TestCase):
+    def test_cache_cleanup_is_limited_to_this_branch(self):
+        self.assertIn('--ref "$GITHUB_REF"', _step("Delete old state caches"))
+
+    def test_cleanup_deletes_only_what_the_branch_scoped_list_returns(self):
+        """Run the real cleanup command with a stand-in `gh` and look at what it was asked."""
+        import os
+        import stat
+        import subprocess
+        import tempfile
+
+        block = re.search(r"(?m)^        run: \|\n((?:          .*\n?)+)", _step("Delete old state caches")).group(1)
+        script = "\n".join(line[10:] for line in block.splitlines())
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "gh.log"
+            fake = Path(tmp) / "gh"
+            # `cache list` prints three ids (as if --jq had already dropped the newest 3); `cache delete` just records.
+            fake.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n[ "$2" = "list" ] && printf "11\\n12\\n"\nexit 0\n')
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", GITHUB_REF="refs/heads/main")
+            subprocess.run(["sh", "-c", script], env=env, check=True)
+            calls = log.read_text().splitlines()
+        listing = [c for c in calls if c.startswith("cache list")]
+        self.assertEqual(len(listing), 1)
+        self.assertIn("--ref refs/heads/main", listing[0])
+        self.assertEqual(sorted(c for c in calls if c.startswith("cache delete")), ["cache delete 11", "cache delete 12"])
+
+    def test_dry_runs_and_test_alerts_never_save_or_delete(self):
+        for name in ("Save state", "Delete old state caches"):
+            step = _step(name)
+            self.assertIn("inputs.dry_run != true", step, name)
+            self.assertIn("inputs.test_alert != true", step, name)
+
+    def test_dry_runs_may_read_the_cache(self):
+        restore = _step("Restore saved state")
+        self.assertIn("actions/cache/restore", restore)
+        self.assertNotIn("inputs.dry_run", restore)
