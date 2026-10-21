@@ -73,6 +73,8 @@ def _warn_about_missing_basics(settings) -> None:
         log.warning("STATE_SALT is not set. Set it to any random text so stored IDs cannot be guessed.")
     if not settings.email_enabled:
         log.warning("Email is not configured (SMTP_USER, SMTP_PASSWORD and EMAIL_TO are needed).")
+    if not settings.healthcheck_url:
+        log.warning("No heartbeat configured (HEALTHCHECK_URL is empty). If GitHub stops this schedule, nothing will tell you.")
 
 
 # --------------------------------------------------------------------------------------
@@ -278,7 +280,10 @@ def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -
     if internal_errors or send_failed:
         heartbeat.ping(settings.healthcheck_url, failed=True)
         return 1
-    heartbeat.ping(settings.healthcheck_url)   # only here: every site checked and every alert delivered
+    # Only here: every site checked and every alert delivered. A ping that cannot be delivered
+    # fails the run, so a wrong HEALTHCHECK_URL shows up as a red job instead of a log line.
+    if settings.healthcheck_url and not heartbeat.ping(settings.healthcheck_url):
+        return 1
     return 0
 
 
@@ -603,6 +608,9 @@ def _print_dry_run(settings, rows, advice, hosting, alerts, auto_detected, stats
             print("  (State is missing, so a real run would HOLD BACK all of these and raise them on the next run.)")
         elif not settings.real_names_in_logs:
             print("  (Details are hidden in public logs. The email carries the full evidence.)")
+    print()
+    print("HEARTBEAT")
+    print(f"  {heartbeat.describe(settings.healthcheck_url)}")
     print()
     print("RUN SUMMARY")
     print(f"  {stats['sites']} sites, {extra['requests']} page visits in total, "
