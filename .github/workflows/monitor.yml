@@ -2,9 +2,10 @@ name: Website Monitor
 
 on:
   schedule:
-    # Every 8 hours (00:00, 08:00 and 16:00 UTC). GitHub may start it a few minutes late.
-    # To run every 2 hours instead, change the line below to:  - cron: "0 */2 * * *"
-    - cron: "0 */8 * * *"
+    # Every 8 hours (00:17, 08:17 and 16:17 UTC). GitHub may start it a few minutes late.
+    # Not minute 0 on purpose: GitHub delays and sometimes drops scheduled runs at the start of the hour.
+    # To run every 2 hours instead, change the line below to:  - cron: "17 */2 * * *"
+    - cron: "17 */8 * * *"
   workflow_dispatch:             # the "Run workflow" button
     inputs:
       dry_run:
