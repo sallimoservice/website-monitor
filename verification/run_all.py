@@ -59,7 +59,7 @@ def main():
         t = time.time()
         done = subprocess.run([sys.executable, os.path.join(str(_paths.HERE), f"suite_{name}.py")], cwd=str(_paths.ROOT), env=env, capture_output=True, text=True, timeout=1500)
         out = done.stdout + done.stderr
-        count = len(re.findall(r"(?m)^PASS ", out))
+        count = len(re.findall(r"(?m)^PASS ", out)) if done.returncode == 0 else 0   # a skipped or failed suite counts nothing
         if done.returncode == 0:
             status = "PASS"
         elif done.returncode == _paths.SKIP_EXIT_CODE:
