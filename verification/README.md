@@ -41,11 +41,12 @@ reads it without aging it, or hard-codes a date. The regression suite deliberate
 | `suite_regression.py` | 15 scenarios against the frozen Stage 1 code (rebuilt from git), three approved differences |
 | `suite_refused_timeline.py` | `connection_refused_is_warning` over time |
 | `suite_request_rules.py` | the request itself and how plain answers are read |
-| `suite_corrupt_state.py` | damaged state files, including documented known gaps |
+| `suite_corrupt_state.py` | damaged state files (unreadable ones start clean, wrong-typed values are repaired) |
 | `suite_stale_state.py` | an 8-day-old state, including documented known gaps |
 | `suite_load_and_timing.py` | requests per site per run, and the time a bad run takes |
 
 The "round" names are historical (the order the suites were written in).
 
-Two rows assert a **known gap** as it is today (see `STAGE_B.md`). When that gap is fixed the row fails
-on purpose and the expectation must be changed.
+One row group still asserts a **known gap** as it is today: the wording after a long gap ("Down for 193
+hours", see `suite_stale_state.py` and `STAGE_B.md` item 3). When it is fixed the row fails on purpose and the
+expectation must be changed.

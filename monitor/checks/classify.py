@@ -54,9 +54,10 @@ STRICT_DOWN_SIGNALS = frozenset({DNS_FAIL, CONN_FAIL, CF_ORIGIN_ERROR})
 # Cloudflare answered, but with a page meant to stop visitors or bots. We cannot look
 # inside the real site, and we say nothing about it.
 INSPECTION_BLOCKED_SIGNALS = frozenset({CHALLENGE, CF_VISITOR_BLOCK})
-# Signals that all mean "the server behind Cloudflare is in trouble". On a Cloudflare site that is
-# (including one an external monitor watches), three visits in a row from this family give a WARNING (all
-# CF_ORIGIN_ERROR is still a DOWN). A plain 5xx without Cloudflare headers counts too (is_origin_trouble). A mix such as 522, then 504, then a timeout is still trouble.
+# Signals that all mean "the server behind Cloudflare is in trouble". On a strict site (Cloudflare, detected
+# Cloudflare, or one an external monitor watches) three visits in a row from this family give a WARNING.
+# All CF_ORIGIN_ERROR is still a DOWN. A plain 5xx without Cloudflare headers counts too (see
+# is_origin_trouble). A mix such as 522, then 504, then a timeout is still trouble.
 ORIGIN_TROUBLE_SIGNALS = frozenset({CF_ORIGIN_ERROR, CF_ORIGIN_UNKNOWN, ORIGIN_5XX, TIMEOUT})
 # Only a clean normal page may be used for content checks or saved as a baseline.
 SCANNABLE_SIGNALS = frozenset({OK})

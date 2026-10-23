@@ -167,11 +167,14 @@ def _handle_not_down(site, site_state, result, now, settings) -> list:
                 site_state["down_inconclusive_since"] = now
             site_state["inspection_blocked"] = signal in c.INSPECTION_BLOCKED_SIGNALS
             return []
-        site_state["pending_recovery"] = {
-            "down_since": site_state["down_since"],
-            "recovered_at": now,
-            "last_up_at": site_state["last_up_at"],
-        }
+        if site_state["down_notified_at"] is not None:
+            # Only an outage the owner was actually told about gets a "back online" email. If the DOWN
+            # email never got through, saying "back online" would be about something they never saw.
+            site_state["pending_recovery"] = {
+                "down_since": site_state["down_since"],
+                "recovered_at": now,
+                "last_up_at": site_state["last_up_at"],
+            }
         site_state.update(down_since=None, down_notified_at=None, down_signal=None, down_inconclusive_since=None)
     site_state["status"] = "up"
 

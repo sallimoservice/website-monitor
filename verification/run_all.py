@@ -29,7 +29,7 @@ SUITES = [
     ("regression", "15 scenarios against the frozen Stage 1 code, three approved differences"),
     ("refused_timeline", "connection_refused_is_warning over time"),
     ("request_rules", "the request itself and how plain answers are read"),
-    ("corrupt_state", "damaged state files (includes documented known gaps)"),
+    ("corrupt_state", "damaged state files (unreadable start clean, wrong-typed values repaired)"),
     ("stale_state", "an 8-day-old state (includes documented known gaps)"),
     ("load_and_timing", "requests per site per run and the time a bad run takes"),
 ]

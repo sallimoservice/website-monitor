@@ -133,7 +133,11 @@ def run_notify_crash(settings) -> int:
         tag="crash",
     )
     result = dispatch([alert], notifiers)
-    if result.delivered[0]:
+    if result.delivered[0] and state.get("_fresh"):
+        # There was no saved state. Writing one now would leave an empty file that looks like a real
+        # state, and the next run would lose its clean-start protection. The crash alert may repeat.
+        log.info("No saved state exists, so the crash alert time is not remembered.")
+    elif result.delivered[0]:
         state["meta"]["last_crash_alert"] = now
         state_store.save_state(settings.state_path, state)
     return 0 if result.delivered[0] else 1

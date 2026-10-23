@@ -104,6 +104,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}   # so a crash also pings /fail
         run: python -m monitor.main --notify-crash
 
       - name: Save state

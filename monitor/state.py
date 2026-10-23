@@ -60,6 +60,82 @@ def _fresh_state() -> dict:
     return {"version": STATE_VERSION, "meta": {"created": time.time()}, "sites": {}, "_fresh": True}
 
 
+# Which fields hold what. Anything not listed in a set below, with a default of None, holds a timestamp.
+_TEXT_OR_NONE = frozenset({"down_signal", "baseline_hash"})
+_DICT_OR_NONE = frozenset({"pending_recovery"})
+_META_NUMBERS = ("last_run", "created", "last_crash_alert", "state_rebuilt_at")
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _value_ok(key: str, default, value) -> bool:
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, str):
+        return isinstance(value, str)
+    if isinstance(default, list):
+        return isinstance(value, list)
+    if value is None:
+        return True
+    if key in _TEXT_OR_NONE:
+        return isinstance(value, str)
+    if key in _DICT_OR_NONE:
+        return isinstance(value, dict)
+    return _is_number(value)
+
+
+def _history_row_ok(row) -> bool:
+    return (
+        isinstance(row, (list, tuple))
+        and len(row) == 3
+        and _is_number(row[0])
+        and (row[1] is None or row[1] in (0, 1))
+        and (row[2] is None or _is_number(row[2]))
+    )
+
+
+def repair_state(state: dict) -> int:
+    """Replace values of the wrong type with their defaults. Returns how many were repaired.
+
+    A hand-edited or half-written state.json used to crash every run (and the same bad file was
+    saved again), which left every website unmonitored. Now a bad value is reset, a site entry that is
+    not an object is dropped (that site starts as new), and everything else is kept.
+    """
+    repaired = 0
+    if not isinstance(state.get("meta"), dict):
+        state["meta"] = {}
+        repaired += 1
+    for key in _META_NUMBERS:
+        if key in state["meta"] and not _is_number(state["meta"][key]):
+            del state["meta"][key]
+            repaired += 1
+    for site_id in list(state["sites"]):
+        entry = state["sites"][site_id]
+        if not isinstance(entry, dict):
+            del state["sites"][site_id]
+            repaired += 1
+            continue
+        for key, default in DEFAULT_SITE_STATE.items():
+            if key in entry and not _value_ok(key, default, entry[key]):
+                entry[key] = copy.deepcopy(default)
+                repaired += 1
+        if isinstance(entry.get("history"), list):
+            good = [list(row) for row in entry["history"] if _history_row_ok(row)]
+            repaired += len(entry["history"]) - len(good)
+            entry["history"] = good
+        # Values that only make sense together. A repaired field must not leave a half-state behind.
+        pending = entry.get("pending_recovery")
+        if isinstance(pending, dict) and not (_is_number(pending.get("down_since")) and _is_number(pending.get("recovered_at"))):
+            entry["pending_recovery"] = None
+            repaired += 1
+        if entry.get("status") == "down" and not _is_number(entry.get("down_since")):
+            entry["down_since"] = state["meta"].get("last_run") or time.time()   # the best guess we have
+            repaired += 1
+    return repaired
+
+
 def load_state(path: str) -> dict:
     """Load state.json. A missing or damaged file simply starts a fresh state."""
     state_file = Path(path)
@@ -71,6 +147,9 @@ def load_state(path: str) -> dict:
         if not isinstance(state, dict) or not isinstance(state.get("sites"), dict):
             raise ValueError("unexpected layout")
         state.setdefault("meta", {})
+        repaired = repair_state(state)
+        if repaired:
+            log.warning("Saved state had %d value(s) of the wrong type. They were reset, the rest was kept.", repaired)
         return state
     except (ValueError, OSError):
         log.warning("Saved state was unreadable, starting fresh.")

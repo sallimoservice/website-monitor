@@ -76,6 +76,8 @@ def _doh_query(url: str, host: str, record_type: str) -> str:
         data = response.json()
     except Exception:
         return "ERROR"
+    if not isinstance(data, dict):
+        return "ERROR"   # an answer we cannot read is our lookup failing, never a DNS failure
     status = data.get("Status")
     if status == 3:
         return "NXDOMAIN"

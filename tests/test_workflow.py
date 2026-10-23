@@ -82,3 +82,9 @@ class TimeoutTests(unittest.TestCase):
         minutes = int(re.search(r"(?m)^    timeout-minutes:\s*(\d+)", _text()).group(1))
         self.assertGreaterEqual(minutes, 15)
         self.assertGreaterEqual(minutes, 2 * self.WORST_CASE_MINUTES, "a run killed by the limit is a silent run")
+
+
+class CrashStepTests(unittest.TestCase):
+    def test_crash_step_can_ping_healthchecks(self):
+        # Without this secret the "/fail" ping in --notify-crash never fires on a real crash.
+        self.assertIn("HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}", _step("Alert that the monitor is broken"))
