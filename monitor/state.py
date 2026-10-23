@@ -50,6 +50,10 @@ DEFAULT_SITE_STATE = {
     "last_slow_alert": None,    # when we last delivered a slow warning
     "refused_active": False,    # True while a "connection refused" warning is in effect
     "last_refused_alert": None, # when we last delivered a connection-refused warning
+    "blocked_active": False,    # the monitor cannot load the site but other locations can ("runner may be blocked")
+    "last_blocked_alert": None,
+    "unconfirmed_active": False,      # the monitor cannot load the site and the outside check gave no clear answer
+    "last_unconfirmed_alert": None,
     "history": [],              # [[timestamp, 1 clean / 0 down / null unknown, response ms], ...]
 }
 

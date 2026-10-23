@@ -67,6 +67,7 @@ class CacheTests(unittest.TestCase):
             step = _step(name)
             self.assertIn("inputs.dry_run != true", step, name)
             self.assertIn("inputs.test_alert != true", step, name)
+            self.assertIn("inputs.test_confirm != true", step, name)
 
     def test_dry_runs_may_read_the_cache(self):
         restore = _step("Restore saved state")
@@ -75,12 +76,13 @@ class CacheTests(unittest.TestCase):
 
 
 class TimeoutTests(unittest.TestCase):
-    # Worst case measured and reasoned in the audit: about 6.5 minutes of checks plus about 1 minute of setup.
-    WORST_CASE_MINUTES = 7.5
+    # About 7.5 minutes of setup and checks, then (for a failing site) a 5 minute wait, a second runner check of
+    # up to 6.5 minutes and two outside checks of about a minute each. The monitor itself should never be cut off.
+    WORST_CASE_MINUTES = 20
 
     def test_job_timeout_leaves_room_over_the_worst_case(self):
         minutes = int(re.search(r"(?m)^    timeout-minutes:\s*(\d+)", _text()).group(1))
-        self.assertGreaterEqual(minutes, 15)
+        self.assertGreaterEqual(minutes, 25)
         self.assertGreaterEqual(minutes, 2 * self.WORST_CASE_MINUTES, "a run killed by the limit is a silent run")
 
 
@@ -88,3 +90,18 @@ class CrashStepTests(unittest.TestCase):
     def test_crash_step_can_ping_healthchecks(self):
         # Without this secret the "/fail" ping in --notify-crash never fires on a real crash.
         self.assertIn("HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}", _step("Alert that the monitor is broken"))
+
+
+class ConfirmSettingsTests(unittest.TestCase):
+    def test_the_run_step_receives_the_confirmation_settings(self):
+        step = _step("Run monitor")
+        for line in ("GLOBALPING_TOKEN: ${{ secrets.GLOBALPING_TOKEN }}", "CONFIRM_ENABLED: ${{ vars.CONFIRM_ENABLED }}",
+                     "CONFIRM_WAIT_SECONDS: ${{ vars.CONFIRM_WAIT_SECONDS }}"):
+            self.assertIn(line, step)
+
+    def test_the_crash_step_does_not_get_the_confirmation_token(self):
+        self.assertNotIn("GLOBALPING", _step("Alert that the monitor is broken"))
+
+    def test_test_confirm_is_a_manual_option_that_runs_the_flag(self):
+        self.assertIn("test_confirm:", _text())
+        self.assertIn("python -m monitor.main --test-confirm", _step("Run monitor"))

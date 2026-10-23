@@ -52,10 +52,15 @@ it can be judged on its own later.
    SKIPPED, and a skip is never counted as a pass. One documented known gap is asserted as it is today (the
    wording after a gap), so fixing item 3 above will make those rows fail on purpose and the expectation
    must then be updated.
-10. **Smaller ones.** A second opinion from an external checker for "connection refused" (the SRTC Limo
-    case), a cap on reminder emails for very long outages, SETTINGS HELP wording for `behind_cloudflare` (it only matters before a Cloudflare
+10. **Smaller ones.** (A second opinion for "connection refused" is now built in: every would-be DOWN is
+    confirmed from outside locations, see `monitor/checks/confirm.py`.) A cap on reminder emails for very long outages, SETTINGS HELP wording for `behind_cloudflare` (it only matters before a Cloudflare
     response has been seen, and it hides certificate warnings), daily summary lines for DNS degraded,
     unrecognised Cloudflare codes and a rebuilt state.
+
+11. **A second free confirmation source.** `ConfirmationSource` in `monitor/checks/confirm.py` is a two-member
+    interface (`name`, `check(site, runner_result) -> Confirmation`), so a Cloudflare Worker or a GitLab CI job can
+    be added to `build_sources` without touching the decision logic. Today only Globalping is asked. Useful if
+    Globalping's probes turn out to be blocked by the same hosts as the runner, or if its free limit is too tight.
 
 ## Stage C and D (unchanged from the earlier plan)
 

@@ -126,6 +126,11 @@ class Settings:
     # Environment
     in_actions: bool
     real_names_in_logs: bool
+    # Independent confirmation (see checks/confirm.py). The kill switch is CONFIRM_ENABLED=false.
+    confirm_enabled: bool = True
+    confirm_wait_seconds: float = 300.0
+    globalping_token: str = ""      # optional and free. Without it the free anonymous limit applies
+    globalping_url: str = "https://api.globalping.io/v1"
 
     @property
     def email_enabled(self) -> bool:
@@ -137,7 +142,7 @@ class Settings:
 
     def sensitive_values(self) -> list:
         """Secrets that must never be printed."""
-        return [self.smtp_password, self.smtp_user, self.smtp_from, self.healthcheck_url, *self.email_to]
+        return [self.smtp_password, self.smtp_user, self.smtp_from, self.healthcheck_url, self.globalping_token, *self.email_to]
 
 
 @dataclass(frozen=True)
@@ -198,6 +203,10 @@ def load_settings() -> Settings:
         max_workers=20,
         in_actions=in_actions,
         real_names_in_logs=real_names,
+        confirm_enabled=_env_bool("CONFIRM_ENABLED", True),
+        confirm_wait_seconds=_env_number("CONFIRM_WAIT_SECONDS", 300.0, float),
+        globalping_token=_env("GLOBALPING_TOKEN"),
+        globalping_url=_env("GLOBALPING_URL", "https://api.globalping.io/v1"),
     )
 
 

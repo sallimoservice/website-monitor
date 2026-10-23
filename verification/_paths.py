@@ -24,6 +24,10 @@ for path in ((str(HERE),) if os.environ.get("VERIFY_USE_PYTHONPATH") else (str(R
     if path not in sys.path:
         sys.path.insert(0, path)
 
+# The older suites are about the runner alone and must never reach for the internet. Outside confirmation is
+# switched off for them here, and suite_confirm.py switches it on again for itself.
+os.environ.setdefault("CONFIRM_ENABLED", "false")
+
 SKIP_EXIT_CODE = 77   # "this suite could not run here" (never counted as a pass)
 
 

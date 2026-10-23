@@ -8,7 +8,7 @@ Useful options: `--only round6` (one suite), `--allow-skips`, `--keep` (keep the
 
 Everything runs against fake services on localhost: `cf_server.py` (fake sites that behave like
 Cloudflare, on ports 8083 and 8443), `fake_smtp.py` (mail server on port 465, writes `.eml` files),
-`fake_healthchecks.py` (port 8084). Nothing touches the internet, and DNS-over-HTTPS is replaced by a
+`fake_healthchecks.py` (port 8084), and for the confirmation suite a fake Globalping (`tests/fake_globalping.py`, a random port). Nothing touches the internet, and DNS-over-HTTPS is replaced by a
 stand-in, so the result is the same with or without a network. The fake certificate is made fresh for
 every run with `openssl`. All files are written to a temporary folder, never into the repository.
 
@@ -41,9 +41,13 @@ reads it without aging it, or hard-codes a date. The regression suite deliberate
 | `suite_regression.py` | 15 scenarios against the frozen Stage 1 code (rebuilt from git), three approved differences |
 | `suite_refused_timeline.py` | `connection_refused_is_warning` over time |
 | `suite_request_rules.py` | the request itself and how plain answers are read |
+| `suite_confirm.py` | independent confirmation of DOWN through the real command line: blocked runner, confirmed outage and recovery, broken confirmation service, blips, mass failure, kill switch, dry run, `--test-confirm`. `SHOW_MAIL=1` prints every email |
 | `suite_corrupt_state.py` | damaged state files (unreadable ones start clean, wrong-typed values are repaired) |
 | `suite_stale_state.py` | an 8-day-old state, including documented known gaps |
 | `suite_load_and_timing.py` | requests per site per run, and the time a bad run takes |
+
+Outside confirmation is switched off for every suite except `suite_confirm.py` (`_paths.py` sets
+`CONFIRM_ENABLED=false`), so the older suites keep describing the runner alone and never reach for the internet.
 
 The "round" names are historical (the order the suites were written in).
 
