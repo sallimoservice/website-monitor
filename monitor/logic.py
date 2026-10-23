@@ -24,6 +24,16 @@ Labels are separate from alerts. A site only gets the label UP when the monitor 
 normal page. A 403 or 503 answer, a missing response or a challenge page never earns UP, even
 when (as always) no alert is sent for it.
 - If an alert could not be delivered by any channel, it is tried again on the next run.
+
+Independent confirmation (checks/confirm.py, on unless CONFIRM_ENABLED=false). The runner is one viewpoint, so
+a failure seen only from there is never a DOWN. A site becomes DOWN only when the outside check agrees in two
+rounds. Anything else is a WARNING or nothing at all:
+  runner fails, outside locations load the site   WARNING "the monitor may be blocked", once a day
+  the outside check gave no clear answer          WARNING "could not confirm", once a day
+  the failure cleared on the second look          nothing
+  many sites failed at the same moment            one summary WARNING (sent by main.py), no DOWN
+"Back online" is only sent for an outage that was confirmed AND announced, so none of the warnings above
+can ever lead to one. DNS failures need no outside check (two public resolvers already agree).
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ import math
 
 from .alerts import DOWN, RECOVERED, WARNING, Alert
 from .checks import classify as c
+from .checks import confirm
 from .checks.network import dns_words
 from .state import record_history
 from .timeutil import fmt_time, fmt_utc
@@ -42,8 +53,11 @@ WARNING_REMINDER_SECONDS = 24 * 3600
 DNS_OR_CONNECTION = (c.DNS_FAIL, c.CONN_FAIL)
 
 
-def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> list:
-    """Update one site's state from a check result and return the alerts to send."""
+def evaluate_uptime(site, site_state: dict, result, now: float, settings, confirmation=None) -> list:
+    """Update one site's state from a check result and return the alerts to send.
+
+    `confirmation` is what the outside check decided for this site (checks/confirm.py ConfirmOutcome), or None.
+    """
     response_ms = round(result.response_time * 1000) if result.response_time is not None else None
     if result.cloudflare:
         site_state["cloudflare_seen"] = True
@@ -59,6 +73,11 @@ def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> lis
         site_state["origin_trouble_active"] = False
 
     is_down = result.verdict == c.VERDICT_DOWN
+    outcome = _outside_outcome(site, site_state, result, settings, confirmation) if is_down else None
+    unconfirmed = is_down and outcome is not None and outcome.outcome != confirm.OUTCOME_CONFIRMED_DOWN
+    if not unconfirmed:
+        site_state["blocked_active"] = False
+        site_state["unconfirmed_active"] = False
     # A site that is already DOWN stays in the normal DOWN flow. Timeouts, DNS errors,
     # SSL errors and HTTP errors are never downgraded, only refused connections.
     refused_as_warning = (
@@ -68,7 +87,7 @@ def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> lis
         and site_state["status"] != "down"
     )
     # History: 1 = clean page, 0 = confirmed down, None = unknown (no usable page either way).
-    if is_down and not refused_as_warning:
+    if is_down and not refused_as_warning and not unconfirmed:
         history_flag = False
     elif result.signal == c.OK:
         history_flag = True
@@ -79,10 +98,13 @@ def evaluate_uptime(site, site_state: dict, result, now: float, settings) -> lis
     if refused_as_warning:
         site_state["inspection_blocked"] = False
         alerts = _refused_warning(site, site_state, result, now, settings)
+    elif unconfirmed:
+        site_state["refused_active"] = False
+        alerts = _handle_unconfirmed(site, site_state, result, now, settings, outcome)
     else:
         site_state["refused_active"] = False
         if is_down:
-            alerts = _handle_down(site, site_state, result, now, settings)
+            alerts = _handle_down(site, site_state, result, now, settings, outcome)
         else:
             alerts = _handle_not_down(site, site_state, result, now, settings)
     site_state["last_state"] = _final_state(site_state, result)
@@ -98,6 +120,8 @@ def _final_state(site_state: dict, result) -> str:
         or site_state["text_missing_active"]
         or site_state["config_error_active"]
         or site_state["origin_trouble_active"]
+        or site_state["blocked_active"]
+        or site_state["unconfirmed_active"]
     ):
         return "WARNING"
     if result.signal in c.INSPECTION_BLOCKED_SIGNALS:
@@ -112,7 +136,86 @@ def _final_state(site_state: dict, result) -> str:
     return "UP"
 
 
-def _handle_down(site, site_state, result, now, settings) -> list:
+def _outside_outcome(site, site_state, result, settings, confirmation):
+    """What the outside check decided for a would-be DOWN, or None when no outside check applies.
+
+    With confirmation on, a would-be DOWN that needs an outside opinion and has none (the step crashed or
+    never ran) counts as "could not confirm". A missing answer is never a DOWN.
+    """
+    if not settings.confirm_enabled:
+        return None
+    if confirmation is not None:
+        return confirmation
+    if confirm.is_candidate(site, result, site_state["status"] == "down"):
+        return confirm.ConfirmOutcome(confirm.OUTCOME_UNCONFIRMED, "the outside check did not run")
+    return None
+
+
+def _handle_unconfirmed(site, site_state, result, now, settings, outcome) -> list:
+    """The runner could not load the site, and the outside check did not confirm an outage."""
+    kind = outcome.outcome
+    if kind == confirm.OUTCOME_RUNNER_BLOCKED and site_state["status"] == "down":
+        # An outage that was confirmed earlier, and now other locations load the site: it is back.
+        alerts = _handle_not_down(site, site_state, result, now, settings, outcome)
+        alerts.extend(_blocked_warning(site, site_state, result, now, settings, outcome))
+        return alerts
+    # Only the warning that applies now stays active, so a daily reminder keeps counting from the same episode.
+    site_state["blocked_active"] = site_state["blocked_active"] and kind == confirm.OUTCOME_RUNNER_BLOCKED
+    site_state["unconfirmed_active"] = site_state["unconfirmed_active"] and kind == confirm.OUTCOME_UNCONFIRMED
+    if kind == confirm.OUTCOME_RUNNER_BLOCKED:
+        return _blocked_warning(site, site_state, result, now, settings, outcome)
+    if kind == confirm.OUTCOME_UNCONFIRMED:
+        return _unconfirmed_warning(site, site_state, result, now, settings, outcome)
+    return []   # a blip, or one of many sites failing together (main.py sends one summary for those)
+
+
+def _blocked_warning(site, site_state, result, now, settings, outcome) -> list:
+    """Other locations load the site and the monitor cannot. Visitors are probably fine."""
+
+    def make():
+        return Alert(
+            kind=WARNING,
+            site_name=site.name,
+            url=site.url,
+            summary=(
+                "The monitor cannot load this site, but other locations around the world can. The monitor itself "
+                "may be blocked by the site's host. This is NOT reported as down."
+            ),
+            details=[
+                ("What to do", "Open the site in a browser. If it loads, the host is probably blocking GitHub's servers. "
+                               "Ask the host to allow the IP address below, or hand this site to an external monitor."),
+                ("Why not DOWN", outcome.reason),
+            ] + confirm.evidence_rows(outcome) + _evidence(result),
+            ts=outcome.decided_at or now,
+            tag="blocked",
+            site_id=site.site_id,
+        )
+
+    return _episode_warning(site_state, now, "blocked_active", "last_blocked_alert", WARNING_REMINDER_SECONDS, make)
+
+
+def _unconfirmed_warning(site, site_state, result, now, settings, outcome) -> list:
+    """The monitor cannot load the site and the outside check could not say why. Never a DOWN."""
+
+    def make():
+        return Alert(
+            kind=WARNING,
+            site_name=site.name,
+            url=site.url,
+            summary=(
+                "The monitor cannot load this site and could not confirm from other locations whether it is really "
+                "down. It is NOT reported as down. It is checked again on the next run."
+            ),
+            details=[("Why it is not confirmed", outcome.reason)] + confirm.evidence_rows(outcome) + _evidence(result),
+            ts=outcome.decided_at or now,
+            tag="unconfirmed",
+            site_id=site.site_id,
+        )
+
+    return _episode_warning(site_state, now, "unconfirmed_active", "last_unconfirmed_alert", WARNING_REMINDER_SECONDS, make)
+
+
+def _handle_down(site, site_state, result, now, settings, outcome=None) -> list:
     site_state["inspection_blocked"] = False
     site_state["down_inconclusive_since"] = None
     if result.verdict == c.VERDICT_DOWN:
@@ -128,9 +231,9 @@ def _handle_down(site, site_state, result, now, settings) -> list:
     last = site_state["down_notified_at"]
     reminder_seconds = settings.down_reminder_hours * 3600
     if last is None:
-        return [_down_alert(site, site_state, result, now, settings, reminder=False)]
+        return [_down_alert(site, site_state, result, now, settings, reminder=False, outcome=outcome)]
     if now - last >= reminder_seconds:
-        return [_down_alert(site, site_state, result, now, settings, reminder=True)]
+        return [_down_alert(site, site_state, result, now, settings, reminder=True, outcome=outcome)]
     return []
 
 
@@ -151,36 +254,40 @@ def _clears_outage(site_state, result) -> bool:
     return False
 
 
-def _handle_not_down(site, site_state, result, now, settings) -> list:
+def _handle_not_down(site, site_state, result, now, settings, outside=None) -> list:
+    """`outside` is set only when other locations load a site the monitor cannot: that ends an open outage."""
     alerts = []
     signal = result.signal
     cloudflare_site = site.behind_cloudflare or site_state["cloudflare_seen"]
 
     if site_state["status"] == "down":
-        if result.origin_trouble_confirmed and site_state["down_signal"] == c.CF_ORIGIN_ERROR:
+        if outside is None and result.origin_trouble_confirmed and site_state["down_signal"] == c.CF_ORIGIN_ERROR:
             # The origin is still in trouble, only the kind of error changed (522, then 504 ...).
             # That is the same outage, so the 8 hour reminders carry on.
             return _handle_down(site, site_state, result, now, settings)
-        if not _clears_outage(site_state, result):
+        if outside is None and not _clears_outage(site_state, result):
             # Inconclusive answer. Keep the outage open, send nothing (not even a reminder).
             if site_state["down_inconclusive_since"] is None:
                 site_state["down_inconclusive_since"] = now
             site_state["inspection_blocked"] = signal in c.INSPECTION_BLOCKED_SIGNALS
             return []
-        site_state["pending_recovery"] = {
-            "down_since": site_state["down_since"],
-            "recovered_at": now,
-            "last_up_at": site_state["last_up_at"],
-        }
+        if site_state["down_notified_at"] is not None:
+            # Only an outage the owner was actually told about gets a "back online" email. If the DOWN
+            # email never got through, saying "back online" would be about something they never saw.
+            site_state["pending_recovery"] = {
+                "down_since": site_state["down_since"],
+                "recovered_at": now,
+                "last_up_at": site_state["last_up_at"],
+            }
         site_state.update(down_since=None, down_notified_at=None, down_signal=None, down_inconclusive_since=None)
     site_state["status"] = "up"
 
     if site_state["pending_recovery"]:
-        alerts.append(_recovered_alert(site, site_state, result, now, settings))
+        alerts.append(_recovered_alert(site, site_state, result, now, settings, outside))
 
     # Any page that is not a clean normal page cannot be used for content checks.
     site_state["inspection_blocked"] = signal != c.OK
-    if signal == c.OK or (signal == c.HTTP_ERROR and not result.strict):
+    if signal == c.OK or (signal == c.HTTP_ERROR and not result.strict) or outside is not None:
         site_state["last_up_at"] = now
 
     if signal == c.OK:
@@ -381,19 +488,25 @@ def _evidence(result) -> list:
     return rows
 
 
-def _down_alert(site, site_state, result, now, settings, reminder: bool) -> Alert:
+def _down_alert(site, site_state, result, now, settings, reminder: bool, outcome=None) -> Alert:
     details = [
         ("Checks", f"{result.attempts} attempts, at least {settings.retry_gap_seconds:g} seconds apart, all failed"),
         ("Down since", fmt_time(site_state["down_since"])),
     ]
     if reminder:
         details.append(("Down for", _hours_text(now - site_state["down_since"])))
+    summary = result.error or "Website is not responding"
+    outside = []
+    if outcome is not None:
+        summary += ". Other locations around the world could not load it either."
+        details.append(("Confirmed", outcome.reason))
+        outside = confirm.evidence_rows(outcome)
     return Alert(
         kind=DOWN,
         site_name=site.name,
         url=site.url,
-        summary=result.error or "Website is not responding",
-        details=details + _evidence(result),
+        summary=summary,
+        details=details + outside + _evidence(result),
         ts=now,
         tag="down",
         site_id=site.site_id,
@@ -406,7 +519,7 @@ def _hours_text(seconds: float) -> str:
     return f"{hours} hour" + ("" if hours == 1 else "s")
 
 
-def _recovered_alert(site, site_state, result, now, settings) -> Alert:
+def _recovered_alert(site, site_state, result, now, settings, outside=None) -> Alert:
     pending = site_state["pending_recovery"]
     # Checks run every few hours, so the true downtime is "up to" the gap between the last
     # run that saw the site working and the run that saw it working again.
@@ -418,6 +531,10 @@ def _recovered_alert(site, site_state, result, now, settings) -> Alert:
         ),
         ("Down since", fmt_time(pending["down_since"])),
     ]
+    if outside is not None:
+        details.append(("How it was seen", "Other locations around the world can load it again. The monitor itself still "
+                                           "cannot, so the monitor may be blocked."))
+        details.extend(confirm.evidence_rows(outside))
     return Alert(
         kind=RECOVERED,
         site_name=site.name,
@@ -452,3 +569,7 @@ def apply_delivery(state: dict, alert: Alert, now: float) -> None:
         site_state["last_config_alert"] = now
     elif alert.tag == "origin":
         site_state["last_origin_alert"] = now
+    elif alert.tag == "blocked":
+        site_state["last_blocked_alert"] = now
+    elif alert.tag == "unconfirmed":
+        site_state["last_unconfirmed_alert"] = now

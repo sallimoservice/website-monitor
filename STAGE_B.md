@@ -26,10 +26,8 @@ it can be judged on its own later.
    gives history, a file you can open at 2am, and `git revert` for a bad state. Consider making the repo
    private at the same time (ends the 60-day rule, hides state). Not verified: free Actions minutes for
    private repos, and whether a commit to a non-default branch counts as repository activity.
-2. **State shape validation.** Truncated or garbage files already give a clean start. A file with the
-   wrong types inside (a site entry that is a string, history that is not a list, a timestamp that is a
-   string) crashes every run, and the poisoned file is saved again. Quarantine such a file and start
-   clean, loudly.
+2. **State shape validation. DONE** (audit fix): wrong-typed values are reset, a site entry that is not an
+   object is dropped, and the run carries on instead of crashing every time.
 3. **Wording after a gap.** After a long silence an alert can say "Down for 193 hours" or "Downtime up to
    201 hours" about time the monitor was not running. Add a "the monitor did not run between X and Y"
    line, and stop using the fixed "checked every 8 hours" text, which is wrong after a dropped run.
@@ -51,13 +49,18 @@ it can be judged on its own later.
    `verification/` and run with `python verification/run_all.py`. They need the `openssl` command, git
    history (the Stage 1 comparison rebuilds commit 6a5c558) and permission to listen on localhost port 465
    (root on Linux, because the monitor only uses SSL mail on exactly port 465). A suite that cannot run says
-   SKIPPED, and a skip is never counted as a pass. Two documented known gaps are asserted as they are today
-   (damaged state with wrong types, and the wording after a gap), so fixing items 2 and 3 above will make
-   those rows fail on purpose and the expectation must then be updated.
-10. **Smaller ones.** A second opinion from an external checker for "connection refused" (the SRTC Limo
-    case), a cap on reminder emails for very long outages, SETTINGS HELP wording for `behind_cloudflare` (it only matters before a Cloudflare
+   SKIPPED, and a skip is never counted as a pass. One documented known gap is asserted as it is today (the
+   wording after a gap), so fixing item 3 above will make those rows fail on purpose and the expectation
+   must then be updated.
+10. **Smaller ones.** (A second opinion for "connection refused" is now built in: every would-be DOWN is
+    confirmed from outside locations, see `monitor/checks/confirm.py`.) A cap on reminder emails for very long outages, SETTINGS HELP wording for `behind_cloudflare` (it only matters before a Cloudflare
     response has been seen, and it hides certificate warnings), daily summary lines for DNS degraded,
     unrecognised Cloudflare codes and a rebuilt state.
+
+11. **A second free confirmation source.** `ConfirmationSource` in `monitor/checks/confirm.py` is a two-member
+    interface (`name`, `check(site, runner_result) -> Confirmation`), so a Cloudflare Worker or a GitLab CI job can
+    be added to `build_sources` without touching the decision logic. Today only Globalping is asked. Useful if
+    Globalping's probes turn out to be blocked by the same hosts as the runner, or if its free limit is too tight.
 
 ## Stage C and D (unchanged from the earlier plan)
 

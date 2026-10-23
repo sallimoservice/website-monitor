@@ -4,6 +4,7 @@
     python -m monitor.main --dry-run      run all checks, print results, send nothing
     python -m monitor.main --test-alert   send a test message to every configured channel
     python -m monitor.main --notify-crash used by the workflow when the monitor itself crashes
+    python -m monitor.main --test-confirm [HOST]  one live check against Globalping, prints the raw answer shape
 
 Only the standard library is imported at the top, so the crash alert still works
 even if installing the dependencies is what failed.
@@ -21,7 +22,7 @@ from collections import Counter
 from . import dryrun, heartbeat
 from . import state as state_store
 from .alerts import CRASH, TEST, WARNING, Alert
-from .checks import classify
+from .checks import classify, confirm
 from .checks.network import dns_words, is_cloudflare_address
 from .config import (
     ConfigError,
@@ -46,6 +47,8 @@ def _parse_args(argv):
     parser.add_argument("--dry-run", action="store_true", help="run all checks and print results, send nothing")
     parser.add_argument("--test-alert", action="store_true", help="send a test message to every configured channel")
     parser.add_argument("--notify-crash", action="store_true", help="send a 'monitor is broken' alert")
+    parser.add_argument("--test-confirm", nargs="?", const="example.com", metavar="HOST",
+                        help="make one live outside check (default host example.com) and print what came back")
     return parser.parse_args(argv)
 
 
@@ -104,6 +107,20 @@ def run_test_alert(settings) -> int:
 
 
 # --------------------------------------------------------------------------------------
+# --test-confirm
+# --------------------------------------------------------------------------------------
+def run_test_confirm(settings, host: str) -> int:
+    """One live Globalping measurement of a PUBLIC host (never one of your sites). Shows the raw answer shape."""
+    source = confirm.GlobalpingSource(token=settings.globalping_token, base_url=settings.globalping_url)
+    ok, lines = source.self_test(host)
+    print(f"Runner address as seen from outside: {confirm.lookup_runner_ip() or 'could not be found'}")
+    for line in lines:
+        print(line)
+    print("RESULT " + ("the outside check works." if ok else "the outside check did NOT work. Read the lines above."))
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------------------
 # --notify-crash
 # --------------------------------------------------------------------------------------
 def run_notify_crash(settings) -> int:
@@ -133,7 +150,11 @@ def run_notify_crash(settings) -> int:
         tag="crash",
     )
     result = dispatch([alert], notifiers)
-    if result.delivered[0]:
+    if result.delivered[0] and state.get("_fresh"):
+        # There was no saved state. Writing one now would leave an empty file that looks like a real
+        # state, and the next run would lose its clean-start protection. The crash alert may repeat.
+        log.info("No saved state exists, so the crash alert time is not remembered.")
+    elif result.delivered[0]:
         state["meta"]["last_crash_alert"] = now
         state_store.save_state(settings.state_path, state)
     return 0 if result.delivered[0] else 1
@@ -173,6 +194,9 @@ def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -
 
     log.info("Checking %d website(s)%s ...", len(sites), " (dry run, nothing will be sent)" if dry_run else "")
     results = run_uptime_checks(sites, settings, cloudflare_seen)
+    confirmation, confirm_crashed = _confirm_failures(settings, sites, results, state, cloudflare_seen)
+    for site_id, newer in confirmation.replaced.items():
+        results[site_id] = newer   # the monitor loaded the site on the second look, so that result stands
 
     alerts, rows, advice, hosting, internal_errors = [], [], [], [], 0
     reasons, alert_lines, total_requests = [], [], 0   # extra dry-run report material
@@ -187,7 +211,11 @@ def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -
             continue
         site_state = state_store.get_site_state(state, site.site_id)
         was_blocked = site_state["inspection_blocked"]
-        new_alerts = evaluate_uptime(site, site_state, result, started, settings)
+        outcome = confirmation.outcomes.get(site.site_id)
+        if outcome is not None:
+            result.note = f"outside check, {outcome.outcome.replace('_', ' ')}: {outcome.reason}"
+            counts["confirm_" + outcome.outcome] += 1
+        new_alerts = evaluate_uptime(site, site_state, result, started, settings, outcome)
         alerts.extend(new_alerts)
         total_requests += result.requests_made
         reasons.append((settings.log_name(site), site_state["last_state"], _reason(site, result, site_state)))
@@ -213,6 +241,11 @@ def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -
         if settings.real_names_in_logs:   # per-site lines only on your own PC, never in public logs
             log.info("%-24s %-18s %s", settings.log_name(site), site_state["last_state"], _short_result(result))
 
+    if confirmation.mass_failure:
+        mass = _mass_failure_alert(confirmation, started)
+        alerts.append(mass)
+        alert_lines.append(f"{mass.emoji} {len(confirmation.mass_failure)} sites failed together, one summary WARNING, no DOWN")
+
     if settings.notify_on_blocked_change and not state.get("_fresh") and (paused or resumed):
         alerts.append(_scan_change_alert(paused, resumed, started))
 
@@ -233,6 +266,7 @@ def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -
         "unrecognised_cf_codes": dict(unrecognised_codes),
         "state_rebuilt": rebuilt,
         "alerts_withheld": len(alerts) if rebuilt else 0,
+        "confirmation": {name[len("confirm_"):]: count for name, count in counts.items() if name.startswith("confirm_")},
     }
     _log_aggregate(stats)
 
@@ -277,6 +311,8 @@ def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -
 
     if internal_errors:
         log.error("%d website(s) could not be checked because of an internal error.", internal_errors)
+    if confirm_crashed:
+        internal_errors += 1   # warnings went out instead of DOWNs, but a crash in the outside check must be seen
     if internal_errors or send_failed:
         heartbeat.ping(settings.healthcheck_url, failed=True)
         return 1
@@ -285,6 +321,55 @@ def _run_checks(settings, sites, dry_run: bool, skipped: int = 0, keep_ids=()) -
     if settings.healthcheck_url and not heartbeat.ping(settings.healthcheck_url):
         return 1
     return 0
+
+
+def _confirm_failures(settings, sites, results, state, cloudflare_seen):
+    """Ask outside locations about every site that failed on the runner. Returns (ConfirmationRun, crashed).
+
+    A crash here is logged and never becomes a DOWN: evaluate_uptime turns a missing answer into a
+    "could not confirm" warning.
+    """
+    if not settings.confirm_enabled:
+        if any(r is not None and r.verdict == classify.VERDICT_DOWN for r in results.values()):
+            log.warning("Independent confirmation is switched OFF (CONFIRM_ENABLED=false). DOWN alerts now come from "
+                        "the GitHub runner alone, which can be blocked by a host.")
+        return confirm.ConfirmationRun(), False
+    from .checks.uptime import run_uptime_checks
+
+    try:
+        return confirm.run_confirmation(
+            sites,
+            results,
+            settings,
+            confirm.build_sources(settings),
+            already_down=lambda site: (state["sites"].get(site.site_id) or {}).get("status") == "down",
+            recheck=lambda again: run_uptime_checks(again, settings, cloudflare_seen),
+        ), False
+    except Exception:
+        log.exception("The outside check crashed. No site is reported as DOWN because of it.")
+        return confirm.ConfirmationRun(), True
+
+
+def _mass_failure_alert(confirmation, now) -> Alert:
+    names = ", ".join(s.name for s in confirmation.mass_failure)
+    return Alert(
+        kind=WARNING,
+        site_name="Website Monitor",
+        url="",
+        summary=(
+            f"{len(confirmation.mass_failure)} sites could not be loaded by the monitor at the same moment. That is far more "
+            "likely a problem with the monitor's own connection than that many separate outages, so none of them is "
+            "reported as DOWN."
+        ),
+        details=[
+            ("Sites", names),
+            ("Checked from IP", confirmation.runner_ip or "unknown (the address lookup failed)"),
+            ("What to do", "Open a few of these sites in a browser. If they load, the monitor is being blocked or has a network "
+                           "problem. They are checked again on the next run."),
+        ],
+        ts=now,
+        tag="massfail",
+    )
 
 
 def _scan_change_alert(paused, resumed, now) -> Alert:
@@ -309,6 +394,8 @@ def _log_aggregate(stats) -> None:
     )
     if stats["INSPECTION_BLOCKED"]:
         log.info("%d sites inspection-blocked", stats["INSPECTION_BLOCKED"])
+    if stats["confirmation"]:
+        log.info("Outside check: %s", ", ".join(f"{count} {name.replace('_', ' ')}" for name, count in sorted(stats["confirmation"].items())))
     if stats["mixed"]:
         log.info("%d site(s) showed mixed failure signals: no alert, will look again next run", stats["mixed"])
     if stats["skipped_config"]:
@@ -361,7 +448,7 @@ def _reason(site, result, site_state) -> str:
     ms = f"{result.response_time * 1000:.0f}ms" if result.response_time is not None else "no timing"
     state_name = site_state["last_state"]
     if state_name == "DOWN":
-        return f"{result.signal} on every one of {visits} (HTTP {code}), confirmed down"
+        return f"{result.signal} on every one of {visits} (HTTP {code}), confirmed down" + (f". {result.note}" if result.note else "")
     if state_name == "SLOW":
         return f"clean page but {ms} is over its {site.slow_threshold_seconds:g}s limit"
     if state_name == "UP":
@@ -383,6 +470,8 @@ _ALERT_REASONS = {
     "text": "expected text missing (warning)",
     "cfconfig": "Cloudflare configuration error (warning)",
     "origin": "server behind Cloudflare is failing (warning)",
+    "blocked": "the monitor may be blocked, other locations load the site (warning, not DOWN)",
+    "unconfirmed": "could not confirm from outside (warning, not DOWN)",
 }
 
 
@@ -629,6 +718,8 @@ def main(argv=None) -> int:
             return run_test_alert(settings)
         if args.notify_crash:
             return run_notify_crash(settings)
+        if args.test_confirm is not None:
+            return run_test_confirm(settings, args.test_confirm)
         load = load_sites_report(settings)
         _protect_sites(settings, load.sites)
         _warn_about_missing_basics(settings)

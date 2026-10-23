@@ -29,7 +29,8 @@ SUITES = [
     ("regression", "15 scenarios against the frozen Stage 1 code, three approved differences"),
     ("refused_timeline", "connection_refused_is_warning over time"),
     ("request_rules", "the request itself and how plain answers are read"),
-    ("corrupt_state", "damaged state files (includes documented known gaps)"),
+    ("confirm", "independent confirmation of DOWN, end to end through the command line (fake Globalping)"),
+    ("corrupt_state", "damaged state files (unreadable start clean, wrong-typed values repaired)"),
     ("stale_state", "an 8-day-old state (includes documented known gaps)"),
     ("load_and_timing", "requests per site per run and the time a bad run takes"),
 ]
@@ -52,7 +53,7 @@ def main():
         done = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"], cwd=str(_paths.ROOT), env=env, capture_output=True, text=True)
         ran = re.search(r"Ran (\d+) tests?", done.stderr)
         count = int(ran.group(1)) if ran else 0
-        record("unit tests", "tests/ (heartbeat, 520, external sites, workflow file)", "PASS" if done.returncode == 0 else "FAIL", count, time.time() - t, done.stderr[-1500:])
+        record("unit tests", "tests/ (heartbeat, 520, external sites, confirmation, workflow file)", "PASS" if done.returncode == 0 else "FAIL", count, time.time() - t, done.stderr[-1500:])
     for name, what in SUITES:
         if args.only and args.only not in name:
             continue

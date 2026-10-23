@@ -16,6 +16,10 @@ on:
         description: "Send a test message to every configured channel"
         type: boolean
         default: false
+      test_confirm:
+        description: "Make one live outside check (Globalping) of example.com and print what came back"
+        type: boolean
+        default: false
 
 # Only one run at a time, so two runs can never overlap or corrupt the saved state.
 concurrency:
@@ -31,9 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     # A run takes about 4 minutes when sites are failing (3 visits, 60 seconds apart) and up to about
     # 6.5 minutes in the worst case (servers that answer very slowly), plus about a minute of setup.
-    # It takes well under a minute when all is well. 15 minutes leaves room, and still stops a stuck run.
-    # A run killed by this limit is a silent run, so the limit must never be close to the worst case.
-    timeout-minutes: 15
+    # It takes well under a minute when all is well. A site that fails is then checked again from outside
+    # after a 5 minute wait, which can add about 5 + 6.5 + 2 minutes, so the worst case is about 20 minutes.
+    # 40 minutes leaves room, and still stops a stuck run. A run killed by this limit is a silent run, so
+    # the limit must never be close to the worst case.
+    timeout-minutes: 40
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -72,19 +78,28 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          # Optional and free. Without it Globalping's free anonymous limit is used, which is enough.
+          GLOBALPING_TOKEN: ${{ secrets.GLOBALPING_TOKEN }}
           # Optional settings. Add them as repository VARIABLES (not secrets):
           # Settings > Secrets and variables > Actions > Variables. Empty means "use the default".
           NOTIFY_ON_BLOCKED_CHANGE: ${{ vars.NOTIFY_ON_BLOCKED_CHANGE }}
           USER_AGENT: ${{ vars.USER_AGENT }}
+          # Kill switch. Set the variable CONFIRM_ENABLED to false to stop outside confirmation (DOWN alerts then
+          # come from this runner alone again). CONFIRM_WAIT_SECONDS is the pause before the second look (300).
+          CONFIRM_ENABLED: ${{ vars.CONFIRM_ENABLED }}
+          CONFIRM_WAIT_SECONDS: ${{ vars.CONFIRM_WAIT_SECONDS }}
           RETRY_GAP_SECONDS: ${{ vars.RETRY_GAP_SECONDS }}
           # Removed settings. They are passed on only so the monitor can log that they are ignored.
           REQUEST_TIMEOUT_SECONDS: ${{ vars.REQUEST_TIMEOUT_SECONDS }}
           CLOUDFLARE_RETRY_GAP_SECONDS: ${{ vars.CLOUDFLARE_RETRY_GAP_SECONDS }}
           DRY_RUN: ${{ inputs.dry_run }}
           TEST_ALERT: ${{ inputs.test_alert }}
+          TEST_CONFIRM: ${{ inputs.test_confirm }}
         run: |
           if [ "$TEST_ALERT" = "true" ]; then
             python -m monitor.main --test-alert
+          elif [ "$TEST_CONFIRM" = "true" ]; then
+            python -m monitor.main --test-confirm
           elif [ "$DRY_RUN" = "true" ]; then
             python -m monitor.main --dry-run
           else
@@ -93,7 +108,7 @@ jobs:
 
       # If anything above crashed (even installing packages), tell the owner by email.
       - name: Alert that the monitor is broken
-        if: failure() && inputs.test_alert != true && inputs.dry_run != true
+        if: failure() && inputs.test_alert != true && inputs.test_confirm != true && inputs.dry_run != true
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
@@ -104,10 +119,11 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}   # so a crash also pings /fail
         run: python -m monitor.main --notify-crash
 
       - name: Save state
-        if: always() && inputs.dry_run != true && inputs.test_alert != true && hashFiles('state.json') != ''
+        if: always() && inputs.dry_run != true && inputs.test_alert != true && inputs.test_confirm != true && hashFiles('state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: state.json
@@ -118,7 +134,7 @@ jobs:
       # another branch, such as main's. Dry runs and test alerts only READ the saved state. They
       # never save and never delete.
       - name: Delete old state caches
-        if: always() && inputs.dry_run != true && inputs.test_alert != true
+        if: always() && inputs.dry_run != true && inputs.test_alert != true && inputs.test_confirm != true
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}

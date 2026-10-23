@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,9 +84,12 @@ def _env_number(name: str, default, cast):
     if not raw:
         return default
     try:
-        return cast(raw)
+        value = cast(raw)
     except ValueError:
         raise ConfigError(f"{name} must be a number.") from None
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(f"{name} must be a number that is not negative.")
+    return value
 
 
 def _split_list(raw: str) -> tuple:
@@ -122,6 +126,11 @@ class Settings:
     # Environment
     in_actions: bool
     real_names_in_logs: bool
+    # Independent confirmation (see checks/confirm.py). The kill switch is CONFIRM_ENABLED=false.
+    confirm_enabled: bool = True
+    confirm_wait_seconds: float = 300.0
+    globalping_token: str = ""      # optional and free. Without it the free anonymous limit applies
+    globalping_url: str = "https://api.globalping.io/v1"
 
     @property
     def email_enabled(self) -> bool:
@@ -133,7 +142,7 @@ class Settings:
 
     def sensitive_values(self) -> list:
         """Secrets that must never be printed."""
-        return [self.smtp_password, self.smtp_user, self.smtp_from, self.healthcheck_url, *self.email_to]
+        return [self.smtp_password, self.smtp_user, self.smtp_from, self.healthcheck_url, self.globalping_token, *self.email_to]
 
 
 @dataclass(frozen=True)
@@ -194,6 +203,10 @@ def load_settings() -> Settings:
         max_workers=20,
         in_actions=in_actions,
         real_names_in_logs=real_names,
+        confirm_enabled=_env_bool("CONFIRM_ENABLED", True),
+        confirm_wait_seconds=_env_number("CONFIRM_WAIT_SECONDS", 300.0, float),
+        globalping_token=_env("GLOBALPING_TOKEN"),
+        globalping_url=_env("GLOBALPING_URL", "https://api.globalping.io/v1"),
     )
 
 
@@ -267,6 +280,10 @@ def _parse_entry(settings: Settings, position: int, entry, seen_ids: set) -> Sit
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise _EntryError(f"{where} needs a \"url\" starting with http:// or https://.")
+    try:
+        parsed.port   # raises ValueError for a port outside 0-65535
+    except ValueError:
+        raise _EntryError(f"{where}: the port in \"url\" is not a valid number (0 to 65535).") from None
     site_id = make_site_id(settings.state_salt, url)
     if site_id in seen_ids:
         raise _EntryError(f"{where} repeats a URL that is already in the list.")

@@ -36,9 +36,9 @@ variants = {
     "binary garbage": ("\x00\x01\x02garbage", "fresh", 0),
     "unknown future version, same shape": (json.dumps({**good, "version": 9}), "loaded", 0),
     "meta missing entirely": (json.dumps({"version": 2, "sites": good["sites"]}), "loaded", 0),
-    "KNOWN GAP site entry is a string": (json.dumps({**good, "sites": {k: "x" for k in good["sites"]}}), "crash", 1),
-    "KNOWN GAP history is a string": (json.dumps({**good, "sites": {k: {**v, "history": "oops"} for k, v in good["sites"].items()}}), "crash", 1),
-    "KNOWN GAP timestamps are strings": (json.dumps({**good, "sites": {k: {**v, "down_since": "yesterday", "down_notified_at": "x"} for k, v in good["sites"].items()}}), "crash", 1),
+    "site entry is a string (dropped, site starts as new)": (json.dumps({**good, "sites": {k: "x" for k in good["sites"]}}), "loaded", 0),
+    "history is a string (reset)": (json.dumps({**good, "sites": {k: {**v, "history": "oops"} for k, v in good["sites"].items()}}), "loaded", 0),
+    "timestamps are strings (reset)": (json.dumps({**good, "sites": {k: {**v, "down_since": "yesterday", "down_notified_at": "x"} for k, v in good["sites"].items()}}), "loaded", 0),
 }
 for label, (content, kind, code) in variants.items():
     path = f"{SP}/audit/state_x.json"
@@ -52,5 +52,9 @@ for label, (content, kind, code) in variants.items():
     expect(f"{label}: {seen}, exit {done.returncode}", seen == kind and done.returncode == code, f"expected {kind}/{code}")
     if seen == "fresh":
         expect(f"{label}: a fresh start sends no email", mails == 0, str(mails))
+    if kind == "loaded" and "(" in label and done.returncode == 0:
+        saved = json.load(open(path))
+        types_ok = all(isinstance(v, dict) and isinstance(v["history"], list) for v in saved["sites"].values())
+        expect(f"{label}: the state saved afterwards is clean", types_ok and len(saved["sites"]) == len(good["sites"]))
 print("\nRESULT:", "ALL PASSED" if not failed else f"{len(failed)} FAILED -> {failed}")
 sys.exit(1 if failed else 0)
